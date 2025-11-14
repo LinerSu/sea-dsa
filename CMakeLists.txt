@@ -9,7 +9,6 @@ endif()
 # determine if this is top-level or embedded project
 if (PROJECT_NAME STREQUAL CMAKE_PROJECT_NAME)
   set (TOP_LEVEL TRUE)
-
 else()
   set (TOP_LEVEL FALSE)
 endif()
@@ -151,6 +150,7 @@ install(DIRECTORY include/seadsa DESTINATION include
 
 if (TOP_LEVEL)
   install (FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md DESTINATION .)
+  add_subdirectory(py)
 endif()
 
 if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
