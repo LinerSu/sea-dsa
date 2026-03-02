@@ -315,6 +315,8 @@ struct DOTGraphTraits<seadsa::Graph *> : public DefaultDOTGraphTraits {
         OS << "fillcolor=chocolate1, style=filled";
       } else if (N->isTypeCollapsed() && seadsa::g_IsTypeAware) {
         OS << "fillcolor=darkorchid2, style=filled";
+      } else if (N->isPartialCollapsed()) {
+        OS << "fillcolor=gold2, style=filled";
       } else {
         OS << "fillcolor=gray, style=filled";
       }
@@ -350,6 +352,22 @@ struct DOTGraphTraits<seadsa::Graph *> : public DefaultDOTGraphTraits {
         if (N->isTypeCollapsed() && seadsa::g_IsTypeAware) OS << "TYPE-";
         OS << "COLLAPSED";
       } else {
+        if (N->isPartialCollapsed()) {
+          const auto &chunks = N->getChunks();
+          OS << "{";
+          if (chunks.begin() != chunks.end()) {
+            bool firstChunk = true;
+            for (const auto &ck : chunks) {
+              if (!firstChunk) OS << ",";
+              firstChunk = false;
+              OS << "[" << ck.getStartOffset() << "-"
+                 << (ck.getEndOffset() ? std::to_string(ck.getEndOffset().get())
+                                       : "+oo")
+                 << "]";
+            }
+          }
+          OS << "}:oC,";
+        }
         // Go through all the types, and just print them.
         const auto &ts = N->types();
         bool firstType = true;

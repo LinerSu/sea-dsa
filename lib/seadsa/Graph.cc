@@ -33,6 +33,10 @@ static llvm::cl::opt<bool, true> XTypeAware(
     "sea-dsa-type-aware", llvm::cl::desc("Enable SeaDsa type awareness"),
     llvm::cl::location(seadsa::g_IsTypeAware), llvm::cl::init(false));
 
+static llvm::cl::opt<bool> EnablePartialCollapse(
+    "sea-dsa-partial-collapse",
+    llvm::cl::desc("Enable SeaDsa partial offset collapse"),
+    llvm::cl::init(false));
 namespace seadsa {
 
 class DsaAllocator {
@@ -127,6 +131,11 @@ unsigned Node::Offset::getNumericOffset() const {
   assert(!n->isForwarding());
   if (n->isOffsetCollapsed()) return 0;
   if (n->isArray()) return offset % n->size();
+  for (auto &ck : n->getChunks()) {
+    if (ck.includes(offset)) {
+      return ck.getStartOffset();
+    }
+  }
   return offset;
 }
 
@@ -187,6 +196,11 @@ void Node::addAccessedType(unsigned off, llvm::Type *type) {
     Offset offset(*this, o);
     growSize(offset, t);
     if (isOffsetCollapsed()) return;
+    for (auto &ck : getChunks()) {
+      if (ck.includes(offset.getNumericOffset())) {
+        return;
+      }
+    }
 
     // -- recursively expand structures
     if (const StructType *sty = dyn_cast<const StructType>(t)) {
@@ -293,6 +307,7 @@ void Node::collapseOffsets(int tag) {
     n.m_nodeType.join(m_nodeType);
     n.setOffsetCollapsed(true);
     n.m_size = 1;
+    // redirectEdges(this, n, 0, g)
     pointTo(n, Offset(n, 0));
   }
 }
@@ -320,12 +335,38 @@ void Node::collapseTypes(int tag) {
   pointTo(n, Offset(n, 0));
 }
 
+void Node::joinChunks(const Node &node, const Offset &offset) {
+  LOG("dsa-collapse", errs() << "Joining chunks between " << &node << " and "
+                             << this << " at offset "
+                             << offset.getNumericOffset() << "\n";);
+  // precondition, each node have disjoint chunks
+  for (auto &ck : node.m_chunks) {
+    LOG("dsa-collapse",
+        errs() << "Found chunk " << ck << " at node " << ck.getNode() << "\n";);
+    unsigned newStart = offset.getNumericOffset() + ck.getStartOffset();
+    boost::optional<unsigned> endOffset = ck.getEndOffset();
+    if (endOffset) {
+      endOffset = offset.getNumericOffset() + endOffset.get();
+    }
+    // unsigned newEnd = offset.getNumericOffset() + ;
+    partialCollapseOffsets(newStart, endOffset, __LINE__);
+  }
+}
+
+/// @brief redirect edges from current node to another node
+///        in paper, this is the redirectEdges function
+/// @param node the target node
+/// @param offset Byte offset into the target node
 void Node::pointTo(Node &node, const Offset &offset) {
   // -- possible under flat dsa graph
   if (&node == this) return;
   assert(&node == &offset.node());
   assert(&node != this);
   assert(!isForwarding());
+
+  LOG("dsa-forward", errs() << "Forwarding links from " << this << " to "
+                            << &node << " at offset "
+                            << offset.getNumericOffset() << "\n";);
 
   // -- reset unique scalar at the destination
   if (offset.getNumericOffset() != 0) node.setUniqueScalar(nullptr);
@@ -337,17 +378,13 @@ void Node::pointTo(Node &node, const Offset &offset) {
     node.setUniqueScalar(nullptr);
   }
 
-  // unsigned sz = size ();
-
   // -- create forwarding link
+  /// This handles move incoming edges of @param node to @param thisnode
   m_forward.pointTo(node, offset.getNumericOffset());
   // -- get updated offset based on how forwarding was resolved
   unsigned noffset = m_forward.getRawOffset();
   // -- at this point, current node is being embedded at noffset
   // -- into node
-
-  // // -- grow the size if necessary
-  // if (sz + noffset > node.size ()) node.growSize (sz + noffset);
 
   assert(!node.isForwarding() || node.getNode()->isOffsetCollapsed() ||
          node.getNode()->isTypeCollapsed());
@@ -363,17 +400,30 @@ void Node::pointTo(Node &node, const Offset &offset) {
   // -- merge allocation sites
   node.joinAllocSites(m_alloca_sites);
 
+  // -- merge all the chunks
+  if (EnablePartialCollapse) {
+    node.joinChunks(*this, offset);
+  }
+
   // -- move all the links
+  LOG("dsa-forward", errs() << "Moving links\n";);
   for (auto &kv : m_links) {
     if (kv.second->isNull()) continue;
+    LOG("dsa-forward",
+        errs() << "link: " << kv.first << " -> " << *kv.second << "\n";);
 
+    // add or unify link at offset
+    // o' -> c
     m_forward.addLink(kv.first, *kv.second);
   }
+
+  LOG("dsa-forward", errs() << "after add node: " << node << "\n";);
 
   // reset current node
   m_alloca_sites.clear();
   m_size = 0;
   m_links.clear();
+  m_chunks.clear();
   m_accessedTypes.clear();
   m_unique_scalar = nullptr;
   m_nodeType.reset();
@@ -473,9 +523,13 @@ void Node::addLink(Field _f, const Cell &c) {
 
 /// Unify a given node into the current node at a specified offset.
 /// Might cause collapse.
+/// @remark: in SEADSA paper, this is the function unifyNodes(n, *this, o, g)
 void Node::unifyAt(Node &n, unsigned o) {
-  assert(!isForwarding());
-  assert(!n.isForwarding());
+  assert(!isForwarding()); // current node is not forwarding node
+  assert(!n.isForwarding()); // unfied node is not forwarding node
+  // NOTE: above two assertions indicate two nodes are representative nodes
+  LOG("dsa-unify", errs() << "Unifying " << n << " into " << *this
+                                << " at offset " << o << "\n";);
 
   // collapse before merging with a collapsed node
   if (!isOffsetCollapsed() && n.isOffsetCollapsed()) {
@@ -484,22 +538,49 @@ void Node::unifyAt(Node &n, unsigned o) {
     return;
   }
 
-  Offset offset(*this, o);
+  Offset offset(*this, o); // o' = o \circleplus_*this 0
+  LOG("dsa-unify", errs() << "Adjusted offset: "
+                                << offset.getNumericOffset() << "\n";);
 
   if (!isOffsetCollapsed() && !n.isOffsetCollapsed() && n.isArray() &&
       !isArray()) {
+    // isNotCollapsed(*this) && isNotCollapsed(n) && isSeq(n) && isNotSeq(*this)
+    /* 
+    Sequence Node n (array, size=stride=4):
+                        +-----------------------+
+          (Adjust)      |       0 ... m * 4     |  (offsets, mod 4)
+        |-- offset ---> +-----------------------+
+                        |        elements       |
+                        +-----------------------+
+                        |
+    Nonsequence Node *this (size=12):
+        +-------+-------+-------+-------+
+        |   0   |   4   |   8   |  12   |  (offsets)
+        +-------+-------+-------+-------+
+        | field1| field2| field3| field4|
+        +-------+-------+-------+-------+
+    */
     // -- merge into array at offset 0
-    if (offset.getNumericOffset() == 0) {
-      n.unifyAt(*this, 0);
+    // check if *this node can be embedded into sequence n at offset o'
+    if (offset.getNumericOffset() == 0) { // o' == 0
+      n.unifyAt(*this, 0); // unifyNodes(*this, n, 0, g)
       return;
     }
-    // -- cannot merge array at non-zero offset
+    // -- cannot merge array at non-zero offset, collapse
     else {
-      collapseOffsets(__LINE__);
-      getNode()->unifyAt(*n.getNode(), o);
-      return;
+      if (EnablePartialCollapse) {
+        partialCollapseOffsets(offset.getNumericOffset(), boost::none, __LINE__);
+        n.setArray(false);
+        LOG("dsa-unify",
+            errs() << "<" << offset.getNumericOffset() << ", " << n << "\n";);
+      } else {
+        collapseOffsets(__LINE__);
+        getNode()->unifyAt(*n.getNode(), o);
+        return;
+      }
     }
   } else if (isArray() && n.isArray()) {
+    // isSeq(n) && isSeq(*this)
     // merge larger sized array into 0 offset of the smaller array
     // if the size are compatible
     Node *min = size() <= n.size() ? this : &n;
@@ -513,7 +594,7 @@ void Node::unifyAt(Node &n, unsigned o) {
       getNode()->unifyAt(*n.getNode(), o);
       return;
     } else {
-      Offset minoff(*min, o);
+      Offset minoff(*min, o); // o \circleplus_nmin 0
       // -- arrays can only be unified at offset 0
       if (minoff.getNumericOffset() == 0) {
         if (min != this) {
@@ -530,26 +611,152 @@ void Node::unifyAt(Node &n, unsigned o) {
       }
     }
   } else if (isArray() && !n.isArray()) {
+    // isSeq(*this) && isNotSeq(n)
     // collapse whenever merging a non-array into an array at non-0 offset
     // and the non-array does not fit into the array
     if (offset.getNumericOffset() != 0 &&
-        offset.getNumericOffset() + n.size() > size()) {
+        offset.getNumericOffset() + n.size() > size()) { 
+      // o' != 0 && o' + size(n) > size(*this)
       collapseOffsets(__LINE__);
       getNode()->unifyAt(*n.getNode(), o);
       return;
     }
   }
 
-  if (&n == this) {
+  if (&n == this) { // n == *this and offset != 0
     // -- merging the node into itself at a different offset
-    if (offset.getNumericOffset() > 0) collapseOffsets(__LINE__);
+    if (offset.getNumericOffset() > 0) {
+      collapseOffsets(__LINE__);
+    }
     return;
   }
 
   assert(!isForwarding());
   assert(!n.isForwarding());
   // -- move everything from n to this node
+  // create forwarding from n to this, here we did not destroy n until compress
+  // redirectEdges(n, *this, o', g)
   n.pointTo(*this, offset);
+}
+
+void Node::mergeChunkIntoSet(Chunk &ck) {
+  auto it = m_chunks.begin();
+  auto end_it = m_chunks.end();
+
+  // Single pass: merge and collect iterators to erase
+  std::vector<typename chunks_type::iterator> toErase;
+
+  for (it = m_chunks.begin(); it != end_it; ++it) {
+    if (!it->isDisjoint(ck)) {
+      ck.mergeChunkInPlace(*it);
+      toErase.push_back(it);
+    }
+  }
+
+  // Erase in reverse order to maintain iterator validity
+  for (auto rit = toErase.rbegin(); rit != toErase.rend(); ++rit) {
+    m_chunks.erase(*rit);
+  }
+
+  m_chunks.insert(ck);
+}
+
+bool Node::areChunksShownCollapsed() const {
+  if (m_chunks.size() != 1) return false;
+  const auto &ck = *m_chunks.begin();
+  if (ck.getStartOffset() != 0) return false;
+
+  auto end = ck.getEndOffset();
+  if (!end) return true;
+  if (end.get() >= m_size) return true;
+
+  for (const auto &kv : m_accessedTypes)
+    if (kv.first > end.get()) return false;
+
+  return true;
+}
+
+void Node::partialCollapseOffsets(unsigned start, boost::optional<unsigned> end,
+                                  int tag) {
+  if (isOffsetCollapsed()) return;
+  Offset ostart(*this, start);
+  start = ostart.getNumericOffset();
+  if (end) {
+    Offset oend(*this, end.get());
+    end = oend.getNumericOffset();
+  }
+  if (end && start >= end.get()) return;
+  if (start == 0 && end && m_size < end.get()) {
+    collapseOffsets(tag);
+    return;
+  }
+  assert(!FieldType::IsNotTypeAware());
+
+  LOG("dsa-collapse", errs() << "Partial-Offset-Collapse at Line " << tag
+                             << " with offset range [" << start << ", "
+                             << (end ? std::to_string(end.get()) : "+oo")
+                             << "]\n");
+
+  Node::links_type new_links; // remain links that excluded in [start, end)
+                              // unify links within [start, end)
+  SmallVector<std::pair<Field, CellRef>, 16> links_inrange;
+  Chunk tmpChunk(this, start, end);
+  // -- find chunks if already exists
+  // -- if no chunk exists, collect links to be collapsed
+  // To find a chunk, we need to either create one or extend an existing one
+  // E.g.
+  //   ck: |----|          ck: |----------|     ck:   |------|    ck: |------|
+  //         |------|            |------|           |------|     |------------|
+  //       start   end         start   end        start   end  start         end
+  //          (a)                 (b)                 (c)              (d)
+  mergeChunkIntoSet(tmpChunk);
+  if (areChunksShownCollapsed()) {
+    collapseOffsets(tag);
+    return;
+  }
+  // -- find links within [start, end] to be collapsed
+  // -- find links outside [start, end] and keep them as is
+  for (auto &kv : m_links) {
+    const Field &key = kv.first;
+    const CellRef &c = kv.second;
+    unsigned foff = key.getOffset();
+    if (c->isNull()) {
+      continue;
+    }
+    if (foff >= start && (!end || foff <= end.get())) {
+      // -- field offset is within [start, end], collapse
+      links_inrange.push_back({kv.first, std::move(kv.second)});
+    } else {
+      new_links[kv.first] = std::move(kv.second);
+    }
+  }
+  m_links = std::move(new_links);
+
+  // -- update access types for chunks
+  Node::accessed_types_type new_accessed_types;
+  for (auto &kv: m_accessedTypes) {
+    unsigned toff = kv.first;
+    if (toff < start || (end && toff > end.get())) {
+      new_accessed_types.insert(std::make_pair(toff, std::move(kv.second)));
+    }
+  }
+  m_accessedTypes = std::move(new_accessed_types);
+
+  // -- unify all links within [start, end] into one
+  for (auto &kv : links_inrange) {
+    tmpChunk.addLink(kv.first, *kv.second);
+  }
+  LOG("dsa-collapse", errs()
+                          << "After partial collapse node: " << *this << "\n";);
+}
+
+void Node::unifyAt(Node &n, unsigned o1, unsigned o2) {
+  // only work for same node, handle partial collapse
+  if (o1 <= o2) {
+    partialCollapseOffsets(o1, o2, __LINE__);
+  } else {
+    partialCollapseOffsets(o2, o1, __LINE__);
+  }
 }
 
 /// pre: this simulated by n
@@ -710,6 +917,18 @@ void Node::write(raw_ostream &o) const {
         << "(" << kv.second->getOffset() << "," << kv.second->getNode() << ")";
     }
     o << "] ";
+    if (EnablePartialCollapse) {
+      first = true;
+      o << " chunks=[";
+      for (auto &ck: m_chunks) {
+        if (!first)
+          o << ",";
+        else
+          first = false;
+        o << ck;
+      }
+      o << "] ";
+    }
     first = true;
     o << " alloca sites=[";
     for (const Value *a : getAllocSites()) {
@@ -728,6 +947,19 @@ void Node::write(raw_ostream &o) const {
   }
 }
 
+/*******************************************************************************
+ ******************         methods for cell            ************************
+ ******************************************************************************/
+void Cell::write(raw_ostream &o) const {
+  getNode();
+  o << "<" << m_offset << ", ";
+  if (m_node)
+    m_node->write(o);
+  else
+    o << "null";
+  o << ">";
+}
+
 void Cell::dump() const {
   write(errs());
   errs() << "\n";
@@ -740,18 +972,24 @@ bool Cell::isRead() const { return getNode()->isRead(); }
 bool Cell::isModified() const { return getNode()->isModified(); }
 
 void Cell::unify(Cell &c) {
+  LOG("dsa-unify",
+      errs() << "Unifying cell " << c << " into cell " << *this << "\n";);
   if (isNull()) {
     assert(!c.isNull());
     Node *n = c.getNode();
     pointTo(*n, c.getRawOffset());
-  } else if (c.isNull())
+  } else if (c.isNull()) {
     c.unify(*this);
-  else {
+  } else {
     Node &n1 = *getNode();
     unsigned o1 = getRawOffset();
 
     Node &n2 = *c.getNode();
     unsigned o2 = c.getRawOffset();
+    if (EnablePartialCollapse && (&n1) == (&n2) && o1 != o2) {
+      n1.unifyAt(n1, o1, o2);
+      return;
+    }
 
     if (o1 < o2)
       n2.unifyAt(n1, o2 - o1);
@@ -790,8 +1028,13 @@ unsigned Cell::getOffset() const {
     return 0;
   else if (getNode()->isArray())
     return (getRawOffset() % getNode()->size());
-  else
-    return getRawOffset();
+  else {
+    unsigned offset = getRawOffset();
+    auto &chunks = m_node->getChunks();
+    auto it = std::find_if(chunks.begin(), chunks.end(),
+                [offset](const auto &ck) { return ck.includes(offset); });
+    return (it != chunks.end()) ? it->getStartOffset() : offset;
+  }
 }
 
 void Cell::pointTo(Node &n, unsigned offset) {
@@ -807,10 +1050,113 @@ void Cell::pointTo(Node &n, unsigned offset) {
   } else {
     /// grow size as needed. allow offset to go one byte past size
     if (offset < n.size()) n.growSize(offset);
-    m_offset = offset;
+    auto &chunks = m_node->getChunks();
+    auto it = std::find_if(chunks.begin(), chunks.end(),
+                [offset](const auto &ck) { return ck.includes(offset); });
+    m_offset = (it != chunks.end()) ? it->getStartOffset() : offset;
   }
 }
 
+/*******************************************************************************
+ ******************         methods for chunk           ************************
+ ******************************************************************************/
+void Chunk::write(raw_ostream &o) const {
+  getNode();
+  o << "<" << m_start << ", ";
+  if (m_end)
+    o << m_end.get();
+  else
+    o << "+oo";
+  o << ">";
+}
+
+Node *Chunk::getNode() const {
+  if (isNull()) return nullptr;
+
+  Node *n = m_node->getNode();
+  assert((n == m_node && !m_node->isForwarding()) || m_node->isForwarding());
+  if (n != m_node) {
+    assert(m_node->isForwarding());
+    unsigned offset = m_node->getRawOffset();
+    m_start += offset;
+    if (m_end)
+      m_end = m_end.get() + offset;
+    m_node = n;
+  }
+
+  return m_node;
+}
+
+unsigned Chunk::getRawStartOffset() const {
+  // -- resolve forwarding
+  getNode();
+  // -- return current offset
+  return m_start;
+}
+
+unsigned Chunk::getStartOffset() const {
+  // -- adjust the offset based on the kind of node
+  if (isNull() || getNode()->isOffsetCollapsed())
+    return 0;
+  else if (getNode()->isArray())
+    return (getRawStartOffset() % getNode()->size());
+  else
+    return getRawStartOffset();
+}
+
+boost::optional<unsigned> Chunk::getRawEndOffset() const {
+  // -- resolve forwarding
+  getNode();
+  // -- return current offset
+  return m_end;
+}
+
+boost::optional<unsigned> Chunk::getEndOffset() const {
+  // -- adjust the offset based on the kind of node
+  if (isNull() || getNode()->isOffsetCollapsed()) {
+    return 0;
+  }
+  auto end = getRawEndOffset();
+  if (end && getNode()->isArray()) {
+    return (end.get() % getNode()->size());
+  } else {
+    return end;
+  }
+}
+
+void Chunk::pointTo(Node &n, unsigned start, unsigned end) {
+  assert(!n.isForwarding());
+  // n.viewGraph();
+  m_node = &n;
+  // errs() << "dsads\n";
+  if (n.isOffsetCollapsed()) {
+    m_start = 0;
+    m_end = 0;
+  } else if (n.isArray()) { // array cannot have chunks
+    assert(n.size() > 0);
+    m_start = 0;
+    m_end = 0;
+  } else {
+    /// grow size as needed. allow offset to go one byte past size
+    if (end > 0 && end < n.size()) n.growSize(end);
+    m_start = start;
+    if (end == 0 && start > 0) {
+      m_end = boost::none;  // Infinite chunk
+    } else {
+      m_end = end;
+    }
+  }
+}
+
+void Chunk::dump(void) const {
+  write(errs());
+  errs() << "\n";
+}
+
+
+/*******************************************************************************
+ ******************         methods for node            ************************
+ ******************************************************************************/
 unsigned Node::getRawOffset() const {
   if (!isForwarding()) return 0;
   m_forward.getNode();
@@ -1207,16 +1553,6 @@ Graph::callsites() const {
 void Graph::clearCallSites() {
   m_instructionToCallSite.clear();
   m_callSites.clear();
-}
-
-void Cell::write(raw_ostream &o) const {
-  getNode();
-  o << "<" << m_offset << ", ";
-  if (m_node)
-    m_node->write(o);
-  else
-    o << "null";
-  o << ">";
 }
 
 void Node::dump() const {

@@ -59,6 +59,7 @@ static void printMemUsageInfo(nodes_range nodes, llvm::raw_ostream &o) {
         << (int)(n.getAccesses() * 100 / total_accesses)
         << "%) of total memory accesses "
         << "IsOffsetCollapsed=" << n.getNode()->isOffsetCollapsed() << " "
+        << "IsPartialCollapsed=" << n.getNode()->isPartialCollapsed() << " "
         << "IsTypeCollapsed=" << n.getNode()->isTypeCollapsed() << " "
         << "IsSequence=" << n.getNode()->isArray() << "\n";
     }
@@ -69,6 +70,8 @@ static void printGraphInfo(nodes_range nodes, llvm::raw_ostream &o) {
   unsigned total_nodes = 0;
   /// Stats about nodes in the graph
   unsigned num_offset_collapses = 0; // number of offset-collapsed nodes
+  unsigned num_type_collapses = 0;   // number of type-collapsed nodes
+  unsigned num_partial_offset_collapses = 0; // number of partial offset-collapsed nodes
   unsigned num_typed_nodes = 0;      // number of typed nodes
   unsigned num_untyped_nodes = 0;
   unsigned num_nodes_multi_typed_fields = 0;
@@ -80,6 +83,10 @@ static void printGraphInfo(nodes_range nodes, llvm::raw_ostream &o) {
     total_nodes++;
     if (n.getNode()->isOffsetCollapsed()) {
       num_offset_collapses++;
+    } else if (n.getNode()->isTypeCollapsed()) {
+      num_type_collapses++;
+    } else if (n.getNode()->isPartialCollapsed()) { 
+      num_partial_offset_collapses++;
     } else {
       if (n.getNode()->types().empty())
         num_untyped_nodes++;
@@ -95,11 +102,51 @@ static void printGraphInfo(nodes_range nodes, llvm::raw_ostream &o) {
   o << "\t\t" << num_typed_nodes << " typed nodes\n";
   o << "\t\t" << num_untyped_nodes << " untyped nodes\n";
   o << "\t\t" << num_offset_collapses << " offset-collapsed\n";
+  o << "\t\t" << num_type_collapses << " type-collapsed\n";
+  o << "\t\t" << num_partial_offset_collapses << " partial offset-collapsed\n";
   o << "\t\t" << num_nodes_multi_typed_fields << " with multi-typed fields\n";
   if (total_nodes > 0) {
     o << "\t" << (double)num_links / (double)total_nodes
       << " average number of node links (graph fan-out)\n";
     o << "\t" << num_max_links << " maximum number of links of a given node\n";
+    o << "\tLinks in each node:\n";
+    for (const auto &n : nodes) {
+      if (n.getNode()->getNumLinks() == 0) {
+        continue;
+      }
+      o << "\t\t [Node Id " << n.getId()
+        << "] IsCollapsed=" << n.getNode()->isOffsetCollapsed()
+        << " IsPartialCollapsed=" << n.getNode()->isPartialCollapsed()
+        << " has " << n.getNode()->getNumLinks() << " links: {";
+      bool isFirstField = true;
+      for (auto &kv : n.getNode()->links()) {
+        if (isFirstField) {
+          isFirstField = false;
+        } else {
+          o << "; ";
+        }
+        o << "Field:" << kv.first;
+      }
+      o << "}";
+      if (n.getNode()->isPartialCollapsed()) {
+        o << "and " << n.getNode()->getNumChunks() << " chunks: {";
+        bool isFirstChunk = true;
+        for (const auto &chunk : n.getNode()->getChunks()) {
+          if (isFirstChunk) {
+            isFirstChunk = false;
+          } else {
+            o << "; ";
+          }
+          o << "[" << chunk.getStartOffset() << "-"
+            << (chunk.getEndOffset()
+                    ? std::to_string(chunk.getEndOffset().get())
+                    : "+oo")
+            << "]";
+        }
+        o << "}";
+      }
+      o << "\n";
+    }
   }
 }
 
@@ -115,6 +162,8 @@ static void printAllocInfo(nodes_range nodes,
   /// total number of allocation sites
   unsigned total_num_alloc_sites =
       std::distance(alloc_sites.begin(), alloc_sites.end());
+  /// total number of nodes with type disparity
+  unsigned num_type_disparity_nodes = 0;
   // to print type disparity in allocation sizes
   std::vector<std::pair<const NodeInfo *, SmallPtrSet<Type *, 32>>>
       typeDisparity;
@@ -133,6 +182,9 @@ static void printAllocInfo(nodes_range nodes,
     SmallPtrSet<Type *, 32> allocTypes;
     for (const llvm::Value *v : n.getNode()->getAllocSites()) {
       allocTypes.insert(v->getType());
+    }
+    if (allocTypes.size() > 1) {
+      num_type_disparity_nodes++;
     }
     typeDisparity.push_back(
         std::pair<const NodeInfo *, SmallPtrSet<Type *, 32>>(&n, allocTypes));
@@ -160,14 +212,17 @@ static void printAllocInfo(nodes_range nodes,
   o << "\t" << num_orphan_nodes << " number of nodes without allocation site\n";
   o << "\t" << num_orphan_checks
     << " number of memory accesses without allocation site\n";
+  o << "\t" << num_type_disparity_nodes 
+    << " number of nodes with type disparity\n";
   o << "\tType disparity in allocation sites:\n";
   unsigned sz =  (TypeDisparitySummarySize < typeDisparity.size() ?
 		  TypeDisparitySummarySize : typeDisparity.size());
   for (unsigned i = 0; i < sz; ++i) {
     const NodeInfo *nodei = typeDisparity[i].first;
     o << "\t\t [Node Id " << nodei->getId()
-      << "] IsCollapsed=" << nodei->getNode()->isOffsetCollapsed() << " has "
-      << typeDisparity[i].second.size() << " different types: {";
+      << "] IsCollapsed=" << nodei->getNode()->isOffsetCollapsed()
+      << " IsPartialCollapsed=" << nodei->getNode()->isPartialCollapsed() 
+      << " has " << typeDisparity[i].second.size() << " different types: {";
     for (Type *ty : typeDisparity[i].second) {
       o << *ty << ";";
     }
