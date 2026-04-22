@@ -688,6 +688,13 @@ void IntraBlockBuilder::visitSelectInst(SelectInst &SI) {
 void IntraBlockBuilder::visitLoadInst(LoadInst &LI) {
   using namespace seadsa;
 
+  LOG("dsa-load", errs() << "before: \n";
+      // m_graph.write(llvm::errs());
+      errs() << "Visiting Load: " << LI << "\n";);
+  // result = load type, type* p
+  /// What we do here is:
+  /// create a link from cell \p base to cell \p val
+
   // -- skip read from NULL
   if (BlockBuilderBase::isNullConstant(*LI.getPointerOperand())) return;
 
@@ -723,6 +730,7 @@ void IntraBlockBuilder::visitLoadInst(LoadInst &LI) {
   }
 
   Cell base = valueCell(*LI.getPointerOperand()->stripPointerCasts());
+  LOG("dsa-load", errs() << "Base: " << base << "\n";);
   assert(!base.isNull());
   base.addAccessedType(0, LI.getType());
   base.setRead();
@@ -1176,9 +1184,9 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
 
 void IntraBlockBuilder::visitGetElementPtrInst(GetElementPtrInst &I) {
   Value &ptr = *I.getPointerOperand();
-  LOG("dsa-gep", errs() << "before: \n");
-  m_graph.write(llvm::errs());
-  LOG("dsa-gep", errs() << "Visiting GEP: " << I << "\n");
+  LOG("dsa-gep", errs() << "before: \n";
+      // m_graph.write(llvm::errs());
+      errs() << "Visiting GEP: " << I << "\n");
   // <result> = getelementptr <ty>, ptr <ptrval> {, <ty> <idx>}*
   // What we do here is:
   // result = base + (sizeof(type) * idx0) + offset({idx1, ...})

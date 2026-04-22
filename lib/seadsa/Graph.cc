@@ -343,13 +343,12 @@ void Node::joinChunks(const Node &node, const Offset &offset) {
   for (auto &ck : node.m_chunks) {
     LOG("dsa-collapse",
         errs() << "Found chunk " << ck << " at node " << ck.getNode() << "\n";);
-    unsigned newStart = offset.getNumericOffset() + ck.getStartOffset();
-    boost::optional<unsigned> endOffset = ck.getEndOffset();
-    if (endOffset) {
-      endOffset = offset.getNumericOffset() + endOffset.get();
-    }
-    // unsigned newEnd = offset.getNumericOffset() + ;
-    partialCollapseOffsets(newStart, endOffset, __LINE__);
+    // unsigned newStart = offset.getNumericOffset() + ck.getStartOffset();
+    // boost::optional<unsigned> endOffset = ck.getEndOffset();
+    // if (endOffset) {
+    //   endOffset = offset.getNumericOffset() + endOffset.get();
+    // }
+    partialCollapseOffsets(ck.getStartOffset(), ck.getEndOffset(), __LINE__);
   }
 }
 
@@ -687,8 +686,9 @@ void Node::partialCollapseOffsets(unsigned start, boost::optional<unsigned> end,
   }
   if (end && start >= end.get()) return;
   if (start == 0 && end && m_size < end.get()) {
-    collapseOffsets(tag);
-    return;
+    growSize(end.get());
+    // collapseOffsets(tag);
+    // return;
   }
   assert(!FieldType::IsNotTypeAware());
 
@@ -710,10 +710,10 @@ void Node::partialCollapseOffsets(unsigned start, boost::optional<unsigned> end,
   //       start   end         start   end        start   end  start         end
   //          (a)                 (b)                 (c)              (d)
   mergeChunkIntoSet(tmpChunk);
-  if (areChunksShownCollapsed()) {
-    collapseOffsets(tag);
-    return;
-  }
+  // if (areChunksShownCollapsed()) {
+  //   collapseOffsets(tag);
+  //   return;
+  // }
   // -- find links within [start, end] to be collapsed
   // -- find links outside [start, end] and keep them as is
   for (auto &kv : m_links) {
