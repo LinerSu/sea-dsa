@@ -572,6 +572,14 @@ void Node::unifyAt(Node &n, unsigned o) {
       if (EnablePartialCollapse) {
         const unsigned start = offset.getNumericOffset();
         boost::optional<unsigned> end = boost::none;
+        LOG("dsa-array-bound",
+            errs() << "partial-collapse array merge: start=" << start
+                   << ", seq-stride=" << n.size() << ", seq-array-size=";
+            if (auto arrayMaxSize = n.getArrayMaxSize())
+              errs() << arrayMaxSize.get();
+            else
+              errs() << "none";
+            errs() << "\n";);
         if (auto arrayMaxSize = n.getArrayMaxSize()) {
           const unsigned stride = n.size();
           uint64_t arrayLastOffset =
@@ -580,6 +588,13 @@ void Node::unifyAt(Node &n, unsigned o) {
           if (upper <= std::numeric_limits<unsigned>::max())
             end = static_cast<unsigned>(upper);
         }
+        LOG("dsa-array-bound",
+            errs() << "partial-collapse computed interval: [" << start << ",";
+            if (end)
+              errs() << end.get();
+            else
+              errs() << "+oo";
+            errs() << "]\n";);
         partialCollapseOffsets(start, end, __LINE__);
         n.setArray(false);
         LOG("dsa-unify",

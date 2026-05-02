@@ -1034,10 +1034,16 @@ GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
   generic_gep_type_iterator<Value *const *> TI =
       gep_type_begin(srcElemTy, Indicies);
 
+  LOG("dsa-gep-compute",
+      errs() << "computeGepOffset input: ptrTy=" << *ptrTy
+             << ", source-elem=" << *srcElemTy
+             << ", indices=" << Indicies.size() << "\n";);
+
   // Recursively compute offset based on iterating over indicies
   for (unsigned CurIDX = 0, EndIDX = Indicies.size(); CurIDX != EndIDX;
        ++CurIDX, ++TI) {
     Value *idxVal = Indicies[CurIDX];
+    Type *beforeTy = Ty;
     if (StructType *STy = TI.getStructTypeOrNull()) {
       // if type for current index is a struct
       // the index operand must be a constant integer
@@ -1054,15 +1060,31 @@ GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
       }
       // recursively update type if indicies left
       Ty = STy->getElementType(fieldNo);
+      LOG("dsa-gep-compute",
+          errs() << "  idx[" << CurIDX << "] struct: idx=" << *idxVal
+                 << ", type=" << *STy << ", field=" << fieldNo
+                 << ", field-offset=" << fieldOffset
+                 << ", next-type=" << *Ty << ", noffset=" << noffset
+                 << ", divisor=" << divisor << ", range=[";
+          if (lower) errs() << *lower; else errs() << "-oo";
+          errs() << ", ";
+          if (upper) errs() << *upper; else errs() << "+oo";
+          errs() << "], array-size=";
+          if (arraySize) errs() << *arraySize; else errs() << "none";
+          errs() << "\n";);
     } else {
       uint64_t len = 0;
+      bool sawArray = false;
+      Optional<uint64_t> currentArraySize = None;
       // primitive type: pointer, int, array, or vector
       if (PointerType *ptrTy = dyn_cast<PointerType>(Ty)) {
         len = 1;
         Ty = ptrTy->getElementType();
       } else if (Ty->isArrayTy()) {
-        uint64_t currentArraySize = dl.getTypeStoreSize(Ty);
-        if (!arraySize && currentArraySize != 0) arraySize = currentArraySize;
+        sawArray = true;
+        currentArraySize = dl.getTypeStoreSize(Ty);
+        if (!arraySize && currentArraySize.getValue() != 0)
+          arraySize = currentArraySize;
         len = Ty->getArrayNumElements();
         Ty = Ty->getArrayElementType();
       }
@@ -1079,8 +1101,6 @@ GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
       assert(Ty && "Type is neither PointerType nor SequentialType");
 
       uint64_t sz = dl.getTypeStoreSize(Ty); // size of the accessed type
-      LOG("dsa-gep", errs() << "sz: " << sz << ", total len: " << len
-                            << ", idxval: " << *idxVal << "\n";);
       // for accessing index, it could be static or unfixed
       if (ConstantInt *ci = dyn_cast<ConstantInt>(idxVal)) {
         int64_t arrayIdx = ci->getSExtValue();
@@ -1110,6 +1130,24 @@ GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
           }
         }
       }
+      LOG("dsa-gep-compute",
+          errs() << "  idx[" << CurIDX << "] seq: idx=" << *idxVal
+                 << ", input-type=" << *beforeTy
+                 << ", next-type=" << *Ty << ", elem-size=" << sz
+                 << ", len=" << len;
+          if (sawArray) {
+            errs() << ", array-total-size=";
+            if (currentArraySize) errs() << currentArraySize.getValue();
+            else errs() << "none";
+          }
+          errs() << ", noffset=" << noffset << ", divisor=" << divisor
+                 << ", range=[";
+          if (lower) errs() << *lower; else errs() << "-oo";
+          errs() << ", ";
+          if (upper) errs() << *upper; else errs() << "+oo";
+          errs() << "], array-size=";
+          if (arraySize) errs() << *arraySize; else errs() << "none";
+          errs() << "\n";);
     }
   }
 
@@ -1213,19 +1251,7 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
     return;
   }
 
-  LOG("dsa-gep", errs() << "ptr type: " << *ptr.getType() << "\n";);
-  if (ptr.getType()->isPointerTy()) {
-    LOG("dsa-gep", errs() << "pointer element type: "
-                          << *ptr.getType()->getPointerElementType() << "\n";);
-  }
-
   auto off = computeGepOffset(ptr.getType(), indicies, m_dl);
-  LOG("dsa-gep", errs() << "offset computed: (" << off.noffset << ", "
-                        << off.stride << "), range=[";
-      if (off.lower) errs() << *off.lower; else errs() << "-oo"; errs() << ", ";
-      if (off.upper) errs() << *off.upper; else errs() << "+oo";
-      errs() << "], array-size="; if (off.arraySize) errs() << *off.arraySize;
-      else errs() << "none"; errs() << "\n";);
   // off contains (offset, divisor) plus a conservative byte-offset range.
   // offset is the value we computed
   /// @example
@@ -1270,6 +1296,17 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
     // create a node representing the array
     seadsa::Node &n = m_graph.mkNode();
     boost::optional<unsigned> arraySize = toUnsignedArraySize(off.arraySize);
+    LOG("dsa-array-bound",
+        errs() << "gep creates sequence node: stride=" << off.stride
+               << ", array-size=";
+        if (arraySize)
+          errs() << arraySize.get();
+        else if (off.arraySize)
+          errs() << *off.arraySize << " (too large for unsigned)";
+        else
+          errs() << "none";
+        errs() << ", noffset=" << off.noffset
+               << ", base-offset=" << base.getRawOffset() << "\n";);
     n.setArraySize(off.stride, arraySize, arraySize);
     unsigned o = static_cast<unsigned>(off.noffset) + base.getRawOffset();
     if (!baseNode->isArray() && o > 0) {
