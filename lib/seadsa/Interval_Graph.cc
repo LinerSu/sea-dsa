@@ -573,7 +573,10 @@ void Node::unifyAt(Node &n, unsigned o) {
         const unsigned start = offset.getNumericOffset();
         boost::optional<unsigned> end = boost::none;
         if (auto arrayMaxSize = n.getArrayMaxSize()) {
-          uint64_t upper = static_cast<uint64_t>(start) + arrayMaxSize.get();
+          const unsigned stride = n.size();
+          uint64_t arrayLastOffset =
+              arrayMaxSize.get() >= stride ? arrayMaxSize.get() - stride : 0;
+          uint64_t upper = static_cast<uint64_t>(start) + arrayLastOffset;
           if (upper <= std::numeric_limits<unsigned>::max())
             end = static_cast<unsigned>(upper);
         }
