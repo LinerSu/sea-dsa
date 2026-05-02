@@ -20,6 +20,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/CFG.h"
@@ -27,6 +28,7 @@
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
@@ -41,6 +43,8 @@
 #include "seadsa/support/Debug.h"
 
 #include "boost/range/algorithm/reverse.hpp"
+
+#include <limits>
 
 using namespace llvm;
 
@@ -174,8 +178,16 @@ Function *getCalledFunction(CallBase &CB) {
 
 namespace {
 // forward declaration
-std::pair<int64_t, uint64_t>
-computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies, const DataLayout &dl);
+struct GepOffset {
+  int64_t noffset = 0;
+  uint64_t stride = 0;
+  Optional<int64_t> lower;
+  Optional<int64_t> upper;
+  Optional<uint64_t> arraySize;
+};
+
+GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
+                           const DataLayout &dl);
 
 /*****************************************************************************/
 /* BlockBuilderBase */
@@ -393,6 +405,7 @@ public:
 
 void InterBlockBuilder::visitPHINode(PHINode &PHI) {
   if (!PHI.getType()->isPointerTy()) return;
+  LOG("dsa-phinode", errs() << "Visiting PHI: " << PHI << "\n";);
 
   assert(m_graph.hasCell(PHI));
   seadsa::Cell &phi = m_graph.mkCell(PHI, seadsa::Cell());
@@ -674,6 +687,7 @@ void IntraBlockBuilder::visitAllocaInst(AllocaInst &AI) {
 void IntraBlockBuilder::visitSelectInst(SelectInst &SI) {
   using namespace seadsa;
   if (isSkip(SI)) return;
+  LOG("dsa-select", errs() << "Visiting Select: " << SI << "\n";);
 
   assert(!m_graph.hasCell(SI));
 
@@ -924,16 +938,85 @@ template <typename T> T gcd(T a, T b) {
   return a;
 }
 
+static Optional<int64_t> toInt64(const APInt &v) {
+  if (v.getBitWidth() > 64) return None;
+  return v.getSExtValue();
+}
+
+static bool checkedAdd(int64_t a, int64_t b, int64_t &res) {
+  return __builtin_add_overflow(a, b, &res);
+}
+
+static bool checkedMul(int64_t a, uint64_t b, int64_t &res) {
+  if (b > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return true;
+  return __builtin_mul_overflow(a, static_cast<int64_t>(b), &res);
+}
+
+static void addToRange(Optional<int64_t> &lower, Optional<int64_t> &upper,
+                       int64_t addend) {
+  int64_t newLower = 0;
+  if (lower && checkedAdd(*lower, addend, newLower))
+    lower = None;
+  else if (lower)
+    lower = newLower;
+
+  int64_t newUpper = 0;
+  if (upper && checkedAdd(*upper, addend, newUpper))
+    upper = None;
+  else if (upper)
+    upper = newUpper;
+}
+
+static void addScaledRange(Optional<int64_t> &lower, Optional<int64_t> &upper,
+                           int64_t idxLower, int64_t idxUpper, uint64_t scale) {
+  int64_t scaledLower = 0;
+  int64_t scaledUpper = 0;
+  if (checkedMul(idxLower, scale, scaledLower) ||
+      checkedMul(idxUpper, scale, scaledUpper)) {
+    lower = None;
+    upper = None;
+    return;
+  }
+
+  addToRange(lower, upper, scaledLower);
+  addToRange(lower, upper, scaledUpper);
+}
+
+static bool getSignedIndexRange(const Value &idxVal, int64_t &lower,
+                                int64_t &upper) {
+  if (!idxVal.getType()->isIntegerTy()) return false;
+
+  ConstantRange range = computeConstantRange(&idxVal, true);
+  Optional<int64_t> signedMin = toInt64(range.getSignedMin());
+  Optional<int64_t> signedMax = toInt64(range.getSignedMax());
+  if (!signedMin || !signedMax) return false;
+
+  lower = *signedMin;
+  upper = *signedMax;
+  return true;
+}
+
+static boost::optional<unsigned>
+toUnsignedArraySize(Optional<uint64_t> arraySize) {
+  if (!arraySize) return boost::none;
+  if (*arraySize > std::numeric_limits<unsigned>::max()) return boost::none;
+  return static_cast<unsigned>(*arraySize);
+}
+
 /**
    Computes an offset of a gep instruction for a given type and a
    sequence of indicies.
 
-   The first element of the pair is the fixed offset. The second is
-   a gcd of the variable offset.
+   GepOffset::noffset is the fixed offset. GepOffset::stride is a gcd of the
+   variable offset. GepOffset::lower and GepOffset::upper are conservative
+   inclusive byte-offset bounds when they can be represented as int64_t. None
+   means -infinity for lower or +infinity for upper. GepOffset::arraySize is
+   the first statically-known nonzero array extent in bytes along the GEP type
+   path, if any.
  */
-std::pair<int64_t, uint64_t> computeGepOffset(Type *ptrTy,
-                                              ArrayRef<Value *> Indicies,
-                                              const DataLayout &dl) {
+GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
+                           const DataLayout &dl) {
   Type *Ty = ptrTy;
   assert(Ty->isPointerTy());
 
@@ -942,6 +1025,10 @@ std::pair<int64_t, uint64_t> computeGepOffset(Type *ptrTy,
 
   // divisor
   uint64_t divisor = 0;
+
+  Optional<int64_t> lower = 0;
+  Optional<int64_t> upper = 0;
+  Optional<uint64_t> arraySize = None;
 
   Type *srcElemTy = cast<PointerType>(ptrTy)->getElementType();
   generic_gep_type_iterator<Value *const *> TI =
@@ -956,7 +1043,15 @@ std::pair<int64_t, uint64_t> computeGepOffset(Type *ptrTy,
       // the index operand must be a constant integer
       unsigned fieldNo = cast<ConstantInt>(idxVal)->getZExtValue();
       // compute offset for the struct field
-      noffset += dl.getStructLayout(STy)->getElementOffset(fieldNo);
+      uint64_t fieldOffset = dl.getStructLayout(STy)->getElementOffset(fieldNo);
+      noffset += fieldOffset;
+      if (fieldOffset >
+          static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        lower = None;
+        upper = None;
+      } else {
+        addToRange(lower, upper, static_cast<int64_t>(fieldOffset));
+      }
       // recursively update type if indicies left
       Ty = STy->getElementType(fieldNo);
     } else {
@@ -966,6 +1061,8 @@ std::pair<int64_t, uint64_t> computeGepOffset(Type *ptrTy,
         len = 1;
         Ty = ptrTy->getElementType();
       } else if (Ty->isArrayTy()) {
+        uint64_t currentArraySize = dl.getTypeStoreSize(Ty);
+        if (!arraySize && currentArraySize != 0) arraySize = currentArraySize;
         len = Ty->getArrayNumElements();
         Ty = Ty->getArrayElementType();
       }
@@ -994,18 +1091,36 @@ std::pair<int64_t, uint64_t> computeGepOffset(Type *ptrTy,
           // XXX can probably do better. Some negative indexes are positive
           // offsets
           // XXX others are just moving between array cells
-          return std::make_pair(0, 1);
+          return {0, 1, 0, 0, arraySize};
         }
         // static offset
         noffset += (uint64_t)arrayIdx * sz;
+        addScaledRange(lower, upper, arrayIdx, arrayIdx, sz);
       } else {
         // otherwise, computes gcd of variable offset since idx is var for accessing array
         divisor = divisor == 0 ? sz : gcd(divisor, sz);
+        if (sz != 0) {
+          int64_t idxLower = 0;
+          int64_t idxUpper = 0;
+          if (getSignedIndexRange(*idxVal, idxLower, idxUpper))
+            addScaledRange(lower, upper, idxLower, idxUpper, sz);
+          else {
+            lower = None;
+            upper = None;
+          }
+        }
       }
     }
   }
 
-  return std::make_pair(noffset, divisor);
+  LOG("dsa-gep-compute", errs() << "computeGepOffset: offset=" << noffset
+                                << ", divisor=" << divisor << ", range=[";
+      if (lower) errs() << *lower; else errs() << "-oo"; errs() << ", ";
+      if (upper) errs() << *upper; else errs() << "+oo";
+      errs() << "], array-size="; if (arraySize) errs() << *arraySize;
+      else errs() << "none"; errs() << "\n";);
+
+  return {noffset, divisor, lower, upper, arraySize};
 }
 
 /// Computes offset into an indexed type
@@ -1105,51 +1220,60 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
   }
 
   auto off = computeGepOffset(ptr.getType(), indicies, m_dl);
-  LOG("dsa-gep", errs() << "offset computed: (" << off.first << ", "
-                        << off.second << ")\n";);
-  // off with two values, (offset, divisor)
+  LOG("dsa-gep", errs() << "offset computed: (" << off.noffset << ", "
+                        << off.stride << "), range=[";
+      if (off.lower) errs() << *off.lower; else errs() << "-oo"; errs() << ", ";
+      if (off.upper) errs() << *off.upper; else errs() << "+oo";
+      errs() << "], array-size="; if (off.arraySize) errs() << *off.arraySize;
+      else errs() << "none"; errs() << "\n";);
+  // off contains (offset, divisor) plus a conservative byte-offset range.
   // offset is the value we computed
-  /// @example 
+  /// @example
   /// %st.A = type { i32, [50 x %st.B] }
   /// %st.B = type { i32, i32, i32 }
-  ///   %7 = getelementptr inbounds [100 x %st.A], 
+  ///   %7 = getelementptr inbounds [100 x %st.A],
   ///           [100 x %st.A]* %1, i64 0, i64 %5, i32 1, i64 %6, i32 2
-  ///   off.first = 1 x sizeof(i32) + 2 x sizeof(i32) = 12
-  ///   off.second = gcd(sizeof(%st.A), sizeof(%st.B)) = 4
-  if (off.first < 0) { // Q: why offset is negative?
-    if (base.getOffset() + off.first >= 0) {
+  ///   off.noffset = 1 x sizeof(i32) + 2 x sizeof(i32) = 12
+  ///   off.stride = gcd(sizeof(%st.A), sizeof(%st.B)) = 4
+  if (off.noffset < 0) {
+    // Q: why offset is negative?
+    // @example
+    // %.02.i.i18 = getelementptr inbounds i8, i8* %tmp50, i64 -1
+    // where in source code is a pointer arithmetic like %tmp50--
+    if (base.getOffset() + off.noffset >= 0) {
       m_graph.mkCell(gep,
-                     seadsa::Cell(*baseNode, base.getOffset() + off.first));
+                     seadsa::Cell(*baseNode, base.getOffset() + off.noffset));
       return;
     } else {
       // create a new node for gep
       seadsa::Node &n = m_graph.mkNode();
       // gep points to offset 0
       m_graph.mkCell(gep, seadsa::Cell(n, 0));
-      // base of gep is at -off.first
-      // e.g., off.first is -16, then base is unified at offset 16 with n
-      n.unifyAt(*baseNode, -(base.getOffset() + off.first));
+      // base of gep is at -off.noffset
+      // e.g., off.noffset is -16, then base is unified at offset 16 with n
+      n.unifyAt(*baseNode, -(base.getOffset() + off.noffset));
       return;
     }
     // XXX This is now unreachable
-    //    errs() << "Negative GEP: " << "(" << off.first << ", " << off.second
+    //    errs() << "Negative GEP: " << "(" << off.noffset << ", " << off.stride
     //    << ") "
     //           << gep << "\n";
     // XXX current work-around
     // XXX If the offset is negative, convert to an array of stride 1
     LOG("dsa", errs() << "Warning: collapsing negative gep to array: ("
-                      << off.first << ", " << off.second << ")\n"
+                      << off.noffset << ", " << off.stride << ")\n"
                       << "gep: " << gep << "\n"
                       << "base cell: " << base << "\n";);
-    off = std::make_pair(0, 1);
+    off = {0, 1, 0, 0, off.arraySize};
   }
-  if (off.second) { // array with common divisor for computing new size
+  if (off.stride) { // array with common divisor for computing new size
     // create a node representing the array
     seadsa::Node &n = m_graph.mkNode();
-    n.setArraySize(off.second);
-    unsigned o = static_cast<unsigned>(off.first) + base.getRawOffset();
+    boost::optional<unsigned> arraySize = toUnsignedArraySize(off.arraySize);
+    n.setArraySize(off.stride, arraySize, arraySize);
+    unsigned o = static_cast<unsigned>(off.noffset) + base.getRawOffset();
     if (!baseNode->isArray() && o > 0) {
-      /* 
+      /*
       Nonsequence Node n (size=12):
         +-------+-------+-------+-------+
         |   0   |   4   |   8   |  12   |  (offsets)
@@ -1157,7 +1281,8 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
         | field1| field2| field3| field4|
         +-------+-------+-------+-------+
                         |
-      Sequence Node *this (array, sz=stride=off.second):
+      Sequence Node *this (array, sz=stride=off.stride,
+      arraySize=off.arraySize):
                         +-----------------------+
                         |       0 ... m * sz    |
         |-- offset ---> +-----------------------+
@@ -1178,7 +1303,7 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
   } else {
     // a simple case for just computing a new cell based on offset.
     // here we still access the same abstract memory obj (node)
-    m_graph.mkCell(gep, seadsa::Cell(base, off.first));
+    m_graph.mkCell(gep, seadsa::Cell(base, off.noffset));
   }
 }
 

@@ -1,5 +1,13 @@
+if (SEA_BUILD_IDSA)
+  set(SEADSA_GRAPH_SOURCE Interval_Graph.cc)
+else()
+  set(SEADSA_GRAPH_SOURCE Classic_Graph.cc)
+endif()
+
+message(STATUS "Using ${SEADSA_GRAPH_SOURCE} as the graph implementation")
+
 add_llvm_library (SeaDsaAnalysis DISABLE_LLVM_LINK_LLVM_DYLIB
-  Graph.cc
+  ${SEADSA_GRAPH_SOURCE}
   FieldType.cc
   DsaLocal.cc
   DsaGlobal.cc
@@ -28,3 +36,7 @@ add_llvm_library (SeaDsaAnalysis DISABLE_LLVM_LINK_LLVM_DYLIB
   SeaDsaAliasAnalysis.cc
   DsaLibFuncInfo.cc
   )
+
+if (SEA_BUILD_IDSA)
+  target_compile_definitions(SeaDsaAnalysis PUBLIC SEA_BUILD_IDSA)
+endif()

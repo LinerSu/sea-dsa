@@ -51,6 +51,26 @@ using namespace llvm;
 
 namespace seadsa {
 
+static bool hasNonSingletonCollapsedCell(const Node &node) {
+  for (const auto &cell : node.getCollapsedCells()) {
+    auto end = cell.getEndOffset();
+    if (!end || cell.getStartOffset() != end.get()) return true;
+  }
+  return false;
+}
+
+static void writeCollapsedCells(const Node &node, raw_ostream &o) {
+  bool firstCell = true;
+  for (const auto &cell : node.getCollapsedCells()) {
+    if (!firstCell) o << ",";
+    firstCell = false;
+
+    auto end = cell.getEndOffset();
+    o << "[" << cell.getStartOffset() << "-"
+      << (end ? std::to_string(end.get()) : "+oo") << "]";
+  }
+}
+
 namespace internals {
 
 /* XXX: The API of llvm::GraphWriter is not flexible enough.
@@ -315,8 +335,10 @@ struct DOTGraphTraits<seadsa::Graph *> : public DefaultDOTGraphTraits {
         OS << "fillcolor=chocolate1, style=filled";
       } else if (N->isTypeCollapsed() && seadsa::g_IsTypeAware) {
         OS << "fillcolor=darkorchid2, style=filled";
-      } else if (N->isPartialCollapsed()) {
+      } else if (seadsa::hasNonSingletonCollapsedCell(*N)) {
         OS << "fillcolor=gold2, style=filled";
+      } else if (N->isPartialCollapsed()) {
+        OS << "fillcolor=palegreen2, style=filled";
       } else {
         OS << "fillcolor=gray, style=filled";
       }
@@ -353,20 +375,13 @@ struct DOTGraphTraits<seadsa::Graph *> : public DefaultDOTGraphTraits {
         OS << "COLLAPSED";
       } else {
         if (N->isPartialCollapsed()) {
-          const auto &chunks = N->getChunks();
           OS << "{";
-          if (chunks.begin() != chunks.end()) {
-            bool firstChunk = true;
-            for (const auto &ck : chunks) {
-              if (!firstChunk) OS << ",";
-              firstChunk = false;
-              OS << "[" << ck.getStartOffset() << "-"
-                 << (ck.getEndOffset() ? std::to_string(ck.getEndOffset().get())
-                                       : "+oo")
-                 << "]";
-            }
-          }
-          OS << "}:oC,";
+          if (seadsa::hasNonSingletonCollapsedCell(*N))
+            OS << "PARTIAL:";
+          else
+            OS << "CELLS:";
+          seadsa::writeCollapsedCells(*N, OS);
+          OS << "}:CC,";
         }
         // Go through all the types, and just print them.
         const auto &ts = N->types();

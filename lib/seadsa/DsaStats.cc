@@ -27,6 +27,28 @@ using namespace llvm;
 using nodes_range = DsaInfo::live_nodes_const_range;
 using alloc_sites_set = DsaInfo::alloc_sites_set;
 
+static bool hasNonSingletonCollapsedCell(const Node &node) {
+  for (const auto &cell : node.getCollapsedCells()) {
+    auto end = cell.getEndOffset();
+    if (!end || cell.getStartOffset() != end.get()) return true;
+  }
+  return false;
+}
+
+static void writeCollapsedCells(const Node &node, llvm::raw_ostream &o) {
+  bool isFirstCell = true;
+  for (const auto &cell : node.getCollapsedCells()) {
+    if (isFirstCell) {
+      isFirstCell = false;
+    } else {
+      o << "; ";
+    }
+    auto end = cell.getEndOffset();
+    o << "[" << cell.getStartOffset() << "-"
+      << (end ? std::to_string(end.get()) : "+oo") << "]";
+  }
+}
+
 static void printMemUsageInfo(nodes_range nodes, llvm::raw_ostream &o) {
   // Here counters
   unsigned int total_accesses = 0; // count the number of total memory accesses
@@ -59,7 +81,9 @@ static void printMemUsageInfo(nodes_range nodes, llvm::raw_ostream &o) {
         << (int)(n.getAccesses() * 100 / total_accesses)
         << "%) of total memory accesses "
         << "IsOffsetCollapsed=" << n.getNode()->isOffsetCollapsed() << " "
-        << "IsPartialCollapsed=" << n.getNode()->isPartialCollapsed() << " "
+        << "HasCollapsedCells=" << n.getNode()->isPartialCollapsed() << " "
+        << "IsPartialCollapsed=" << hasNonSingletonCollapsedCell(*n.getNode())
+        << " "
         << "IsTypeCollapsed=" << n.getNode()->isTypeCollapsed() << " "
         << "IsSequence=" << n.getNode()->isArray() << "\n";
     }
@@ -85,7 +109,7 @@ static void printGraphInfo(nodes_range nodes, llvm::raw_ostream &o) {
       num_offset_collapses++;
     } else if (n.getNode()->isTypeCollapsed()) {
       num_type_collapses++;
-    } else if (n.getNode()->isPartialCollapsed()) { 
+    } else if (hasNonSingletonCollapsedCell(*n.getNode())) {
       num_partial_offset_collapses++;
     } else {
       if (n.getNode()->types().empty())
@@ -116,7 +140,8 @@ static void printGraphInfo(nodes_range nodes, llvm::raw_ostream &o) {
       }
       o << "\t\t [Node Id " << n.getId()
         << "] IsCollapsed=" << n.getNode()->isOffsetCollapsed()
-        << " IsPartialCollapsed=" << n.getNode()->isPartialCollapsed()
+        << " HasCollapsedCells=" << n.getNode()->isPartialCollapsed()
+        << " IsPartialCollapsed=" << hasNonSingletonCollapsedCell(*n.getNode())
         << " has " << n.getNode()->getNumLinks() << " links: {";
       bool isFirstField = true;
       for (auto &kv : n.getNode()->links()) {
@@ -129,20 +154,9 @@ static void printGraphInfo(nodes_range nodes, llvm::raw_ostream &o) {
       }
       o << "}";
       if (n.getNode()->isPartialCollapsed()) {
-        o << "and " << n.getNode()->getNumChunks() << " chunks: {";
-        bool isFirstChunk = true;
-        for (const auto &chunk : n.getNode()->getChunks()) {
-          if (isFirstChunk) {
-            isFirstChunk = false;
-          } else {
-            o << "; ";
-          }
-          o << "[" << chunk.getStartOffset() << "-"
-            << (chunk.getEndOffset()
-                    ? std::to_string(chunk.getEndOffset().get())
-                    : "+oo")
-            << "]";
-        }
+        o << " and " << n.getNode()->getNumCollapsedCells()
+          << " collapsed cells: {";
+        writeCollapsedCells(*n.getNode(), o);
         o << "}";
       }
       o << "\n";
@@ -221,8 +235,10 @@ static void printAllocInfo(nodes_range nodes,
     const NodeInfo *nodei = typeDisparity[i].first;
     o << "\t\t [Node Id " << nodei->getId()
       << "] IsCollapsed=" << nodei->getNode()->isOffsetCollapsed()
-      << " IsPartialCollapsed=" << nodei->getNode()->isPartialCollapsed() 
-      << " has " << typeDisparity[i].second.size() << " different types: {";
+      << " HasCollapsedCells=" << nodei->getNode()->isPartialCollapsed()
+      << " IsPartialCollapsed="
+      << hasNonSingletonCollapsedCell(*nodei->getNode()) << " has "
+      << typeDisparity[i].second.size() << " different types: {";
     for (Type *ty : typeDisparity[i].second) {
       o << *ty << ";";
     }

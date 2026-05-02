@@ -30,6 +30,7 @@ endif()
 
 option (BUILD_SEA_DSA_LIBS_SHARED "Build all sea-dsa libraries shared." OFF)
 option (ENABLE_SANITY_CHECKS "Enable sea-dsa sanity checks." OFF)
+option (SEA_BUILD_IDSA "Build SeaDSA with the interval graph implementation." OFF)
 
 if (ENABLE_SANITY_CHECKS)
   message (STATUS "Compiling sea-dsa with sanity checks")
