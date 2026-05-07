@@ -29,16 +29,18 @@ using namespace llvm;
 
 namespace seadsa {
 bool g_IsTypeAware;
+bool g_IsPartialCollapseEnabled;
 }
 
 static llvm::cl::opt<bool, true> XTypeAware(
     "sea-dsa-type-aware", llvm::cl::desc("Enable SeaDsa type awareness"),
     llvm::cl::location(seadsa::g_IsTypeAware), llvm::cl::init(false));
 
-static llvm::cl::opt<bool> EnablePartialCollapse(
-    "sea-dsa-partial-collapse",
-    llvm::cl::desc("Enable SeaDsa partial offset collapse"),
-    llvm::cl::init(false));
+static llvm::cl::opt<bool, true>
+    XPartialCollapse("sea-dsa-partial-collapse",
+                     llvm::cl::desc("Enable SeaDsa partial offset collapse"),
+                     llvm::cl::location(seadsa::g_IsPartialCollapseEnabled),
+                     llvm::cl::init(false));
 namespace seadsa {
 
 class DsaAllocator {
@@ -109,6 +111,12 @@ Node::Node(Graph &g, const Node &n, bool cpLinks, bool cpAllocSites)
 
   // -- copy types
   joinAccessedTypes(0, n);
+
+  // -- copy collapsed interval cells
+  for (auto &ck : n.m_collapsedCells) {
+    m_collapsedCells.insert(
+        Cell(this, ck.getRawStartOffset(), ck.getRawEndOffset()));
+  }
 
   // -- copy allocation sites
   if (cpAllocSites) joinAllocSites(n.m_alloca_sites);
@@ -401,7 +409,9 @@ void Node::pointTo(Node &node, const Offset &offset) {
   node.joinAllocSites(m_alloca_sites);
 
   // -- merge all the collapsed interval cells
-  if (EnablePartialCollapse) { node.joinCollapsedCells(*this, offset); }
+  if (seadsa::g_IsPartialCollapseEnabled) {
+    node.joinCollapsedCells(*this, offset);
+  }
 
   // -- move all the links
   LOG("dsa-forward", errs() << "Moving links\n";);
@@ -569,7 +579,7 @@ void Node::unifyAt(Node &n, unsigned o) {
     }
     // -- cannot merge array at non-zero offset, collapse
     else {
-      if (EnablePartialCollapse) {
+      if (seadsa::g_IsPartialCollapseEnabled) {
         const unsigned start = offset.getNumericOffset();
         boost::optional<unsigned> end = boost::none;
         LOG("dsa-array-bound",
@@ -691,13 +701,7 @@ bool Node::areCollapsedCellsShownCollapsed() const {
   if (ck.getStartOffset() != 0) return false;
 
   auto end = ck.getEndOffset();
-  if (!end) return true;
-  if (end.get() >= m_size) return true;
-
-  for (const auto &kv : m_accessedTypes)
-    if (kv.first > end.get()) return false;
-
-  return true;
+  return !end;
 }
 
 void Node::partialCollapseOffsets(unsigned start, boost::optional<unsigned> end,
@@ -767,7 +771,10 @@ void Node::partialCollapseOffsets(unsigned start, boost::optional<unsigned> end,
 
   // -- unify all links within [start, end] into one
   for (auto &kv : links_inrange) {
-    tmpCell.addLink(kv.first, *kv.second);
+    // The exact byte within the collapsed interval is no longer known.
+    // Canonicalize every in-range link to the collapsed interval start while
+    // preserving its field type.
+    tmpCell.addLink(Field(0, kv.first.getType()), *kv.second);
   }
   LOG("dsa-collapse", errs()
                           << "After partial collapse node: " << *this << "\n";);
@@ -940,7 +947,7 @@ void Node::write(raw_ostream &o) const {
         << "(" << kv.second->getOffset() << "," << kv.second->getNode() << ")";
     }
     o << "] ";
-    if (EnablePartialCollapse) {
+    if (seadsa::g_IsPartialCollapseEnabled) {
       first = true;
       o << " collapsed-cells=[";
       for (auto &ck : m_collapsedCells) {
@@ -1025,7 +1032,7 @@ void Cell::unify(Cell &c) {
     Node &n2 = *c.getNode();
     unsigned o2 = c.getRawOffset();
     boost::optional<unsigned> e2 = c.getRawEndOffset();
-    if (EnablePartialCollapse && (&n1) == (&n2)) {
+    if (seadsa::g_IsPartialCollapseEnabled && (&n1) == (&n2)) {
       unsigned start = std::min(o1, o2);
       boost::optional<unsigned> end;
       if (!e1 || !e2)
@@ -1550,6 +1557,33 @@ bool Graph::computeCalleeCallerMapping(const DsaCallSite &cs, Graph &calleeG,
   // XXX: to be removed
   const bool onlyModified = false;
 
+  DsaCallSite::const_actual_iterator AI = cs.actual_begin(),
+                                     AE = cs.actual_end();
+  for (DsaCallSite::const_formal_iterator FI = cs.formal_begin(),
+                                          FE = cs.formal_end();
+       FI != FE && AI != AE; ++FI, ++AI) {
+    const Value *fml = &*FI;
+    const Value *arg = (*AI).get();
+
+    if (calleeG.hasCell(*fml) && callerG.hasCell(*arg)) {
+      Cell &c = calleeG.mkCell(*fml, Cell());
+      if (!onlyModified || c.isModified()) {
+        Cell &nc = callerG.mkCell(*arg, Cell());
+        if (!simMap.insert(c, nc)) {
+          if (reportIfSanityCheckFailed) {
+            errs() << "ERROR 3: callee is not simulated by caller at "
+                   << *cs.getInstruction() << "\n"
+                   << "\tFormal param " << *fml << "\n"
+                   << "\tActual param " << *arg << "\n"
+                   << "\tCallee cell=" << c << "\n"
+                   << "\tCaller cell=" << nc << "\n";
+          }
+          return false;
+        }
+      }
+    }
+  }
+
   for (auto &kv : boost::make_iterator_range(calleeG.globals_begin(),
                                              calleeG.globals_end())) {
     Cell &c = *kv.second;
@@ -1585,41 +1619,14 @@ bool Graph::computeCalleeCallerMapping(const DsaCallSite &cs, Graph &calleeG,
       }
     }
   }
-
-  DsaCallSite::const_actual_iterator AI = cs.actual_begin(),
-                                     AE = cs.actual_end();
-  for (DsaCallSite::const_formal_iterator FI = cs.formal_begin(),
-                                          FE = cs.formal_end();
-       FI != FE && AI != AE; ++FI, ++AI) {
-    const Value *fml = &*FI;
-    const Value *arg = (*AI).get();
-
-    if (calleeG.hasCell(*fml) && callerG.hasCell(*arg)) {
-      Cell &c = calleeG.mkCell(*fml, Cell());
-      if (!onlyModified || c.isModified()) {
-        Cell &nc = callerG.mkCell(*arg, Cell());
-        if (!simMap.insert(c, nc)) {
-          if (reportIfSanityCheckFailed) {
-            errs() << "ERROR 3: callee is not simulated by caller at "
-                   << *cs.getInstruction() << "\n"
-                   << "\tFormal param " << *fml << "\n"
-                   << "\tActual param " << *arg << "\n"
-                   << "\tCallee cell=" << c << "\n"
-                   << "\tCaller cell=" << nc << "\n";
-          }
-          return false;
-        }
-      }
-    }
-  }
   return true;
 }
 
 bool Graph::computeSimulationMapping(Graph &fromG, Graph &toG,
                                      SimulationMapper &simMap,
                                      bool onlyModified) {
-  // Find a simulation relation for all globals
-  for (auto &kv : fromG.globals()) {
+  // Find a simulation relation for all function formal parameters
+  for (auto &kv : fromG.formals()) {
     Cell &c = *kv.second;
     if (!onlyModified || c.isModified()) {
       Cell &nc = toG.mkCell(*kv.first, Cell());
@@ -1627,8 +1634,8 @@ bool Graph::computeSimulationMapping(Graph &fromG, Graph &toG,
     }
   }
 
-  // Find a simulation relation for all function formal parameters
-  for (auto &kv : fromG.formals()) {
+  // Find a simulation relation for all globals
+  for (auto &kv : fromG.globals()) {
     Cell &c = *kv.second;
     if (!onlyModified || c.isModified()) {
       Cell &nc = toG.mkCell(*kv.first, Cell());

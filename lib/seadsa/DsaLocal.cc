@@ -1309,7 +1309,7 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
                << ", base-offset=" << base.getRawOffset() << "\n";);
     n.setArraySize(off.stride, arraySize, arraySize);
     unsigned o = static_cast<unsigned>(off.noffset) + base.getRawOffset();
-    if (!baseNode->isArray() && o > 0) {
+    if (seadsa::g_IsPartialCollapseEnabled && !baseNode->isArray() && o > 0) {
       /*
       Nonsequence Node n (size=12):
         +-------+-------+-------+-------+
