@@ -2,6 +2,8 @@
 #include "seadsa/InitializePasses.hh"
 
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/Dominators.h"
+#include <memory>
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/BasicBlock.h"
@@ -157,6 +159,8 @@ bool AllocWrapInfo::findWrappers(Module &M, Pass *P,
       bool isWrapper = true;
 
       LoopInfo *LI = nullptr;
+      std::unique_ptr<DominatorTree> localDT;
+      std::unique_ptr<LoopInfo> localLI;
       if (P) {
 	// XXX: we would like to use here
 	// getAnalysisIfAvailable. However, this method does not take
@@ -164,6 +168,13 @@ bool AllocWrapInfo::findWrappers(Module &M, Pass *P,
 	// clients must ensure that if P is not null then
 	// LoopInfoWrapperPass is available.
 	LI = &(P->getAnalysis<LoopInfoWrapperPass>(*parentFn).getLoopInfo());
+      } else {
+        // No pass to query (e.g. SeaDsaAAResult's lazy set-up): compute
+        // LoopInfo locally. Without it flowsFrom() rejects every PHI and no
+        // wrapper with error-handling control flow is ever recognised.
+        localDT = std::make_unique<DominatorTree>(*parentFn);
+        localLI = std::make_unique<LoopInfo>(*localDT);
+        LI = localLI.get();
       }
       for (auto &bb : *parentFn) {
         ReturnInst *ret = dyn_cast<ReturnInst>(bb.getTerminator());	

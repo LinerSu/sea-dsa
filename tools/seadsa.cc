@@ -220,7 +220,14 @@ int main(int argc, char **argv) {
       pass_manager.add(seadsa::createDsaCallGraphPrinterPass());
     }
 
-    if (AAEval) { pass_manager.add(llvm::createAAEvalPass()); }
+    if (AAEval) {
+      // Module-pass barrier: without it the legacy pass manager batches the
+      // preceding function passes (RemovePtrToInt, ...) with AAEval, so the
+      // first alias query builds the whole-module DSA graphs while later
+      // functions are still untransformed.
+      pass_manager.add(llvm::createBarrierNoopPass());
+      pass_manager.add(llvm::createAAEvalPass());
+    }
 
     if (!MemDot && !MemViewer && !seadsa::PrintDsaStats &&
         !seadsa::PrintCallGraphStats && !CallGraphDot && !AAEval) {

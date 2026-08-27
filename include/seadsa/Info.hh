@@ -148,6 +148,7 @@ public:
       : m_dl(dl), m_tliWrapper(tliWrapper), m_dsa(dsa) {}
 
   bool runOnModule(llvm::Module &M);
+  void dumpPointerCells(llvm::Module &M, llvm::raw_ostream &o);
   bool runOnFunction(llvm::Function &fn);
 
   // Iterate over all non-trival Dsa nodes

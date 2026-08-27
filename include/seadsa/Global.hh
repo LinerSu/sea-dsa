@@ -41,6 +41,9 @@ enum class GlobalAnalysisKind {
   FLAT_MEMORY
 };
 
+/// The value of the --sea-dsa command-line option (analysis kind).
+GlobalAnalysisKind getDsaGlobalAnalysisKindOption();
+
 // Common API for global analyses
 class GlobalAnalysis {
 protected:

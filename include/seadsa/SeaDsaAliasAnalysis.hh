@@ -22,7 +22,7 @@ namespace seadsa {
 
 class AllocWrapInfo;
 class DsaLibFuncInfo;
-class BottomUpTopDownGlobalAnalysis;
+class GlobalAnalysis;
 
 class SeaDsaAAResult : public llvm::AAResultBase<SeaDsaAAResult> {
   using Base = llvm::AAResultBase<SeaDsaAAResult>;
@@ -50,7 +50,7 @@ private:
   DsaLibFuncInfo &m_dlfi;
   std::unique_ptr<Graph::SetFactory> m_fac; // node factory for seadsa
   std::unique_ptr<llvm::CallGraph> m_cg;
-  std::unique_ptr<BottomUpTopDownGlobalAnalysis> m_dsa;
+  std::unique_ptr<GlobalAnalysis> m_dsa;
 };
 
 class SeaDsaAAWrapperPass : public llvm::ImmutablePass {

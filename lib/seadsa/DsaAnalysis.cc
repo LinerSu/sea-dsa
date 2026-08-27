@@ -39,7 +39,8 @@ static llvm::cl::opt<seadsa::GlobalAnalysisKind> DsaGlobalAnalysis(
 
 namespace seadsa {
 bool PrintDsaStats;
-}
+GlobalAnalysisKind getDsaGlobalAnalysisKindOption() { return DsaGlobalAnalysis; }
+} // namespace seadsa
 
 static llvm::cl::opt<bool, true>
     XDsaStats("sea-dsa-stats",

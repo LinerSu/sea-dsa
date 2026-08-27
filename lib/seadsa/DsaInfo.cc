@@ -20,6 +20,12 @@ static llvm::cl::opt<std::string> DsaToCsv(
         "SeaDsa: print pairs of allocation site and Dsa node into a CSV file"),
     llvm::cl::init(""), llvm::cl::Hidden);
 
+static llvm::cl::opt<std::string> PtrDumpFile(
+    "sea-dsa-ptr-dump",
+    llvm::cl::desc("SeaDsa: dump, for every pointer-typed value, its Dsa node "
+                   "and cell into a CSV file"),
+    llvm::cl::init(""), llvm::cl::Hidden);
+
 static llvm::cl::opt<std::string>
     AllocasToFile("sea-dsa-allocas-to-file",
                   llvm::cl::desc("SeaDsa: print allocation sites into a file"),
@@ -421,12 +427,55 @@ bool DsaInfo::runOnFunction(Function &f) {
   return false;
 }
 
+// --- dump (function, value, node, cell) for every pointer-typed value that
+// --- has a cell: the "object partition per pointer" view used to compare
+// --- against inclusion-based points-to analyses.
+void DsaInfo::dumpPointerCells(Module &M, llvm::raw_ostream &o) {
+  o << "function,value,node,raw_offset,start,end,offset_collapsed,"
+       "type_collapsed,array,partial,in_interval,alloc_sites,"
+       "i2p,p2i,external,incomplete,unknown\n";
+  auto emit = [&](const Function &f, const Value &v, Graph &g) {
+    if (!v.getType()->isPointerTy() || !g.hasCell(v)) return;
+    const Cell &c = g.getCell(v);
+    const Node *n = c.getNode();
+    if (!n) return;
+    const unsigned raw = c.getRawOffset();
+    bool inInterval = false;
+    for (const Cell &ck : n->getCollapsedCells()) {
+      if (ck.includes(raw)) { inInterval = true; break; }
+    }
+    std::string name = v.hasName() ? v.getName().str() : "<unnamed>";
+    o << f.getName() << "," << name << "," << getDsaNodeId(*n) << "," << raw
+      << "," << c.getStartOffset() << ",";
+    if (auto e = c.getEndOffset()) o << e.get(); else o << "inf";
+    o << "," << n->isOffsetCollapsed() << "," << n->isTypeCollapsed() << ","
+      << n->isArray() << "," << n->isPartialCollapsed() << "," << inInterval
+      << "," << n->getAllocSites().size() << "," << n->isIntToPtr() << ","
+      << n->isPtrToInt() << "," << n->isExternal() << "," << n->isIncomplete()
+      << "," << n->isUnknown() << "\n";
+  };
+  for (auto &f : M) {
+    if (f.isDeclaration()) continue;
+    Graph *g = getDsaGraph(f);
+    if (!g) continue;
+    for (auto &a : f.args()) emit(f, a, *g);
+    for (auto &bb : f)
+      for (auto &i : bb) emit(f, i, *g);
+  }
+}
+
 bool DsaInfo::runOnModule(Module &M) {
 
   for (auto &f : M) {
     runOnFunction(f);
   }
   assignAllocSiteId();
+  if (PtrDumpFile != "") {
+    std::error_code EC;
+    raw_fd_ostream file(PtrDumpFile, EC, sys::fs::OF_Text);
+    dumpPointerCells(M, file);
+    file.close();
+  }
   return false;
 }
 
