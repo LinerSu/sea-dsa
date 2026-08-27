@@ -8,6 +8,7 @@ message(STATUS "Using ${SEADSA_GRAPH_SOURCE} as the graph implementation")
 
 add_llvm_library (SeaDsaAnalysis DISABLE_LLVM_LINK_LLVM_DYLIB
   ${SEADSA_GRAPH_SOURCE}
+  Stats.cc
   FieldType.cc
   DsaLocal.cc
   DsaGlobal.cc
@@ -36,6 +37,9 @@ add_llvm_library (SeaDsaAnalysis DISABLE_LLVM_LINK_LLVM_DYLIB
   SeaDsaAliasAnalysis.cc
   DsaLibFuncInfo.cc
   )
+
+target_include_directories(SeaDsaAnalysis BEFORE PUBLIC
+  ${CMAKE_CURRENT_BINARY_DIR}/../../include)
 
 if (SEA_BUILD_IDSA)
   target_compile_definitions(SeaDsaAnalysis PUBLIC SEA_BUILD_IDSA)

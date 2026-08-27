@@ -55,6 +55,8 @@ class DsaAllocator;
 
 /// Global flag controlling whether DSA uses type-aware field sensitivity
 extern bool g_IsTypeAware;
+/// Global flag controlling whether DSA uses partial offset collapse
+extern bool g_IsPartialCollapseEnabled;
 
 /// Data structure graph traversal iterator
 template <typename T> class NodeIterator;

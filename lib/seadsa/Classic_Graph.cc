@@ -27,16 +27,18 @@ using namespace llvm;
 
 namespace seadsa {
 bool g_IsTypeAware;
+bool g_IsPartialCollapseEnabled;
 }
 
 static llvm::cl::opt<bool, true> XTypeAware(
     "sea-dsa-type-aware", llvm::cl::desc("Enable SeaDsa type awareness"),
     llvm::cl::location(seadsa::g_IsTypeAware), llvm::cl::init(false));
 
-static llvm::cl::opt<bool> EnablePartialCollapse(
-    "sea-dsa-partial-collapse",
-    llvm::cl::desc("Enable SeaDsa partial offset collapse"),
-    llvm::cl::init(false));
+static llvm::cl::opt<bool, true>
+    XPartialCollapse("sea-dsa-partial-collapse",
+                     llvm::cl::desc("Enable SeaDsa partial offset collapse"),
+                     llvm::cl::location(seadsa::g_IsPartialCollapseEnabled),
+                     llvm::cl::init(false));
 namespace seadsa {
 
 class DsaAllocator {
@@ -397,7 +399,7 @@ void Node::pointTo(Node &node, const Offset &offset) {
   node.joinAllocSites(m_alloca_sites);
 
   // -- merge all the chunks
-  if (EnablePartialCollapse) { node.joinChunks(*this, offset); }
+  if (g_IsPartialCollapseEnabled) { node.joinChunks(*this, offset); }
 
   // -- move all the links
   LOG("dsa-forward", errs() << "Moving links\n";);
@@ -563,7 +565,7 @@ void Node::unifyAt(Node &n, unsigned o) {
     }
     // -- cannot merge array at non-zero offset, collapse
     else {
-      if (EnablePartialCollapse) {
+      if (g_IsPartialCollapseEnabled) {
         partialCollapseOffsets(offset.getNumericOffset(), boost::none,
                                __LINE__);
         n.setArray(false);
@@ -907,7 +909,7 @@ void Node::write(raw_ostream &o) const {
         << "(" << kv.second->getOffset() << "," << kv.second->getNode() << ")";
     }
     o << "] ";
-    if (EnablePartialCollapse) {
+    if (g_IsPartialCollapseEnabled) {
       first = true;
       o << " chunks=[";
       for (auto &ck : m_chunks) {
@@ -976,7 +978,7 @@ void Cell::unify(Cell &c) {
 
     Node &n2 = *c.getNode();
     unsigned o2 = c.getRawOffset();
-    if (EnablePartialCollapse && (&n1) == (&n2) && o1 != o2) {
+    if (g_IsPartialCollapseEnabled && (&n1) == (&n2) && o1 != o2) {
       n1.unifyAt(n1, o1, o2);
       return;
     }
