@@ -36,6 +36,8 @@
 #include "seadsa/FieldType.hh"
 
 #include <functional>
+#include <utility>
+#include <vector>
 
 namespace llvm {
 class Type;
@@ -896,6 +898,11 @@ public:
   using links_type = boost::container::flat_map<Field, CellRef>;
   /// Set of collapsed interval cells.
   using collapsed_cells_type = boost::container::flat_set<Cell>;
+  /// Snapshot of collapsed intervals as plain [start, end] pairs relative to
+  /// a node (end = boost::none means +oo). Unlike collapsed_cells_type, the
+  /// entries do not refer to a node, so they stay valid once the node forwards.
+  using collapsed_intervals_type =
+      std::vector<std::pair<unsigned, boost::optional<unsigned>>>;
 
   /// Iterator for graph interface (defined in GraphTraits.h)
   using iterator = NodeIterator<Node>;
@@ -1044,7 +1051,24 @@ private:
    */
   void pointTo(Node &node, const Offset &offset);
 
-  void joinCollapsedCells(const Node &node, const Offset &offset);
+  /**
+   * @brief Collapsed intervals of this node, relative to this node
+   *
+   * Must be called while this node is still a representative (not
+   * forwarding). The interval cells point to this node, so once it forwards
+   * the Cell accessors would resolve the forwarding (shifting by the
+   * forwarding offset) and canonicalize through the target's intervals.
+   */
+  collapsed_intervals_type collapsedIntervals() const;
+
+  /**
+   * @brief Import collapsed intervals of a node embedded into this node
+   * @param intervals Intervals relative to the embedded node (see
+   *                  collapsedIntervals(), taken before it forwards)
+   * @param offset Raw offset at which the node is embedded into this node
+   */
+  void joinCollapsedCells(const collapsed_intervals_type &intervals,
+                          unsigned offset);
 
   Cell &getLink_(const Field &_f);
 

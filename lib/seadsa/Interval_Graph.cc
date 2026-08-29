@@ -357,21 +357,38 @@ void Node::collapseTypes(int tag) {
   pointTo(n, Offset(n, 0));
 }
 
-void Node::joinCollapsedCells(const Node &node, const Offset &offset) {
-  LOG("dsa-collapse", errs() << "Joining collapsed cells between " << &node
-                             << " and " << this << " at offset "
-                             << offset.getNumericOffset() << "\n";);
-  // precondition, each node has disjoint interval cells
-  for (auto &ck : node.m_collapsedCells) {
-    LOG("dsa-collapse",
-        errs() << "Found collapsed cell [" << ck.getOffset() << ", ";
-        auto end = ck.getEndOffset(); if (end) errs() << end.get();
-        else errs() << "+oo"; errs() << "] at node " << ck.getNode() << "\n";);
-    unsigned newStart = offset.getNumericOffset() + ck.getOffset();
-    boost::optional<unsigned> endOffset = ck.getEndOffset();
-    if (endOffset) { endOffset = offset.getNumericOffset() + endOffset.get(); }
-    // unsigned newEnd = offset.getNumericOffset() + ;
-    partialCollapseOffsets(newStart, endOffset, __LINE__);
+Node::collapsed_intervals_type Node::collapsedIntervals() const {
+  // The interval cells point to this node. Reading them through the Cell
+  // accessors is only meaningful while this node is a representative:
+  // Cell::getOffset() resolves forwarding (adding the forwarding offset) and
+  // canonicalizes through the collapsed cells of the node it resolves to.
+  assert(!isForwarding());
+  collapsed_intervals_type res;
+  res.reserve(m_collapsedCells.size());
+  for (auto &ck : m_collapsedCells)
+    res.emplace_back(ck.getOffset(), ck.getEndOffset());
+  return res;
+}
+
+void Node::joinCollapsedCells(const collapsed_intervals_type &intervals,
+                              unsigned offset) {
+  LOG("dsa-collapse", errs() << "Joining " << intervals.size()
+                             << " collapsed cells into " << this
+                             << " at offset " << offset << "\n";);
+  // precondition, the intervals are pairwise disjoint and relative to the
+  // embedded node; shift each one ONCE by the embedding offset.
+  for (auto &iv : intervals) {
+    LOG("dsa-collapse", errs() << "Found collapsed cell [" << iv.first << ", ";
+        if (iv.second) errs() << iv.second.get(); else errs() << "+oo";
+        errs() << "]\n";);
+    // a previous interval may have fully collapsed this node (which forwards
+    // it to a fresh collapsed node): nothing left to join then.
+    Node *target = getNode();
+    if (target->isOffsetCollapsed()) break;
+    unsigned newStart = offset + iv.first;
+    boost::optional<unsigned> newEnd = iv.second;
+    if (newEnd) newEnd = offset + newEnd.get();
+    target->partialCollapseOffsets(newStart, newEnd, __LINE__);
   }
 }
 
@@ -399,6 +416,12 @@ void Node::pointTo(Node &node, const Offset &offset) {
 
     node.setUniqueScalar(nullptr);
   }
+
+  // -- snapshot the collapsed intervals of this node while it is still a
+  // -- representative: they are re-imported into the target below, after the
+  // -- forwarding link exists (see collapsedIntervals()).
+  collapsed_intervals_type intervals;
+  if (seadsa::g_IsPartialCollapseEnabled) intervals = collapsedIntervals();
 
   // -- create forwarding link
   /// This handles move incoming edges of @param node to @param thisnode
@@ -431,10 +454,12 @@ void Node::pointTo(Node &node, const Offset &offset) {
     // whereas merging in the opposite direction keeps the interval -- i.e.
     // the result depended on which node was chosen as representative.
     Node &target = *node.getNode();
-    if (!m_collapsedCells.empty() && !target.isOffsetCollapsed() &&
-        !target.isArray())
+    if (!intervals.empty() && !target.isOffsetCollapsed() && !target.isArray())
       target.growSize(noffset + m_size);
-    node.joinCollapsedCells(*this, offset);
+    // Use the resolved raw embedding offset (noffset), not
+    // offset.getNumericOffset(): the latter is re-canonicalized through the
+    // target's collapsed cells, which the joins below are modifying.
+    node.joinCollapsedCells(intervals, noffset);
   }
 
   // -- move all the links
