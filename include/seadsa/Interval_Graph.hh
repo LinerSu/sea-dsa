@@ -30,6 +30,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ImmutableSet.h"
+#include "llvm/ADT/MapVector.h"
 
 #include "seadsa/AllocSite.hh"
 #include "seadsa/FieldType.hh"
@@ -114,15 +115,21 @@ protected:
   /// @brief Collection of nodes in the graph
   NodeVector m_nodes;
 
-  using ValueMap = llvm::DenseMap<const llvm::Value *, CellRef>;
+  // NOTE: these maps are iterated by the bottom-up/top-down phases (e.g.
+  // Graph::globals()) and the order of the resulting clone/unify calls
+  // decides which node becomes the representative in Node::unifyAt. A
+  // pointer-hashed DenseMap makes that order depend on heap addresses (ASLR)
+  // and the analysis result nondeterministic. MapVector iterates in
+  // insertion order, which is fixed by the IR.
+  using ValueMap = llvm::MapVector<const llvm::Value *, CellRef>;
   /// @brief Map from scalars to cells in this graph
   ValueMap m_values;
 
-  using ArgumentMap = llvm::DenseMap<const llvm::Argument *, CellRef>;
+  using ArgumentMap = llvm::MapVector<const llvm::Argument *, CellRef>;
   /// @brief Map from formal arguments to cells
   ArgumentMap m_formals;
 
-  using ReturnMap = llvm::DenseMap<const llvm::Function *, CellRef>;
+  using ReturnMap = llvm::MapVector<const llvm::Function *, CellRef>;
   /// @brief Map from formal returns of functions to cells
   ReturnMap m_returns;
 

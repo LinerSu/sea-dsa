@@ -1395,43 +1395,25 @@ void Graph::removeNodes(std::function<bool(const Node *)> p) {
   if (m_nodes.empty()) return;
 
   // remove entry if it references to a node that satisfies p
-  for (auto it = m_values.begin(), et = m_values.end(); it != et;) {
-    Cell *C = it->second.get();
+  m_values.remove_if([&p](const ValueMap::value_type &kv) {
+    Cell *C = kv.second.get();
     assert(!C->isNull());
-    if (p(C->getNode())) {
-      auto cur_it = it;
-      ++it;
-      m_values.erase(cur_it);
-    } else {
-      ++it;
-    }
-  }
+    return p(C->getNode());
+  });
 
   // remove entry if it references to a node that satisfies p
-  for (auto it = m_formals.begin(), et = m_formals.end(); it != et;) {
-    Cell *C = it->second.get();
+  m_formals.remove_if([&p](const ArgumentMap::value_type &kv) {
+    Cell *C = kv.second.get();
     assert(!C->isNull());
-    if (p(C->getNode())) {
-      auto cur_it = it;
-      ++it;
-      m_formals.erase(cur_it);
-    } else {
-      ++it;
-    }
-  }
+    return p(C->getNode());
+  });
 
   // remove entry if it references to a node that satisfies p
-  for (auto it = m_returns.begin(), et = m_returns.end(); it != et;) {
-    Cell *C = it->second.get();
+  m_returns.remove_if([&p](const ReturnMap::value_type &kv) {
+    Cell *C = kv.second.get();
     assert(!C->isNull());
-    if (p(C->getNode())) {
-      auto cur_it = it;
-      ++it;
-      m_returns.erase(cur_it);
-    } else {
-      ++it;
-    }
-  }
+    return p(C->getNode());
+  });
 
   // -- remove references to nodes that satisfy p
   for (auto &n : m_nodes) {

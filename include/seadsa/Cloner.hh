@@ -1,6 +1,7 @@
 #pragma once
 
 #include "seadsa/Graph.hh"
+#include "llvm/ADT/SetVector.h"
 
 namespace seadsa {
 
@@ -62,7 +63,10 @@ private:
 
   Graph &m_graph;
   llvm::DenseMap<const Node *, std::pair<Node *, CachingLevel>> m_map;
-  llvm::DenseMap<const Node *, llvm::SmallDenseSet<Node *, 4>> m_deferredUnify;
+  // The split nodes are unified in iteration order; a pointer-hashed set
+  // would make the representative (and hence collapse decisions) depend on
+  // heap addresses. SetVector keeps insertion order (deterministic).
+  llvm::DenseMap<const Node *, llvm::SmallSetVector<Node *, 4>> m_deferredUnify;
   CloningContext m_context;
   bool m_strip_allocas;
 
