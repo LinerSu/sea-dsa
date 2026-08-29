@@ -92,6 +92,17 @@ Graph::Graph(const llvm::DataLayout &dl, SetFactory &sf, bool is_flat)
       m_is_flat(is_flat) {}
 
 Graph::~Graph() = default;
+// TEMP-ND: address-free node description for nondeterminism tracing
+static void ndWriteNode(llvm::raw_ostream &o, const Node &n) {
+  o << "N" << n.getId() << "[";
+  std::vector<std::string> names;
+  for (const llvm::Value *v : n.getAllocSites())
+    names.push_back(v->hasName() ? v->getName().str() : "<unnamed>");
+  std::sort(names.begin(), names.end());
+  for (auto &s : names) o << s << " ";
+  o << "]" << (n.isArray() ? "A" : "") << (n.isOffsetCollapsed() ? "C" : "")
+    << (n.isForwarding() ? "F" : "") << " sz=" << n.size();
+}
 Node::Node(Graph &g)
     : m_graph(&g), m_unique_scalar(nullptr), m_has_once_unique_scalar(false),
       m_size(0), m_arrayMinSize(boost::none), m_arrayMaxSize(boost::none),
@@ -285,6 +296,8 @@ void Node::joinAccessedTypes(unsigned offset, const Node &n) {
 /// collapse the current node. Looses all offset-based field sensitivity
 void Node::collapseOffsets(int tag) {
   if (isOffsetCollapsed()) return;
+  LOG("dsa-nd", errs() << "collapse tag=" << tag << " "; ndWriteNode(errs(), *this);
+      errs() << "\n";);
 
   LOG("unique_scalar",
       if (m_unique_scalar) errs()
@@ -539,6 +552,8 @@ void Node::addLink(Field _f, const Cell &c) {
 void Node::unifyAt(Node &n, unsigned o) {
   assert(!isForwarding());   // current node is not forwarding node
   assert(!n.isForwarding()); // unfied node is not forwarding node
+  LOG("dsa-nd", errs() << "unifyAt this="; ndWriteNode(errs(), *this);
+      errs() << " n="; ndWriteNode(errs(), n); errs() << " o=" << o << "\n";);
   // NOTE: above two assertions indicate two nodes are representative nodes
   LOG("dsa-unify", errs() << "Unifying " << n << " into " << *this
                           << " at offset " << o << "\n";);
@@ -708,6 +723,9 @@ bool Node::areCollapsedCellsShownCollapsed() const {
 void Node::partialCollapseOffsets(unsigned start, boost::optional<unsigned> end,
                                   int tag) {
   if (isOffsetCollapsed()) return;
+  LOG("dsa-nd", errs() << "pcollapse tag=" << tag << " [" << start << ",";
+      if (end) errs() << end.get(); else errs() << "+oo"; errs() << "] ";
+      ndWriteNode(errs(), *this); errs() << "\n";);
   Offset ostart(*this, start);
   start = ostart.getNumericOffset();
   if (end) {
@@ -1017,6 +1035,11 @@ bool Cell::isRead() const { return getNode()->isRead(); }
 bool Cell::isModified() const { return getNode()->isModified(); }
 
 void Cell::unify(Cell &c) {
+  LOG("dsa-nd", errs() << "cell-unify this=";
+      if (isNull()) errs() << "null"; else { ndWriteNode(errs(), *getNode()); errs() << "@" << getRawOffset(); }
+      errs() << " c=";
+      if (c.isNull()) errs() << "null"; else { ndWriteNode(errs(), *c.getNode()); errs() << "@" << c.getRawOffset(); }
+      errs() << "\n";);
   LOG("dsa-unify",
       errs() << "Unifying cell " << c << " into cell " << *this << "\n";);
   if (isNull()) {
@@ -1660,6 +1683,7 @@ bool Graph::computeSimulationMapping(Graph &fromG, Graph &toG,
 void Graph::import(const Graph &g, bool withFormals) {
   Cloner C(*this, CloningContext::mkNoContext(), Cloner::Options::Basic);
   for (auto &kv : g.m_values) {
+    LOG("dsa-nd", errs() << "import value " << kv.first->getName() << "\n");
     // -- clone node
     Node *n = nullptr;
     {

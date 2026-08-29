@@ -51,6 +51,9 @@ void TopDownAnalysis::cloneAndResolveArguments(const DsaCallSite &cs,
     // Don't propagate the global down if it's not used by the callee.
     if (!NoTDCopyingOpt)
       if (!calleeG.hasScalarCell(*kv.first)) continue;
+    LOG("dsa-nd", errs() << "TD " << cs.getCaller()->getName() << " -> "
+                         << cs.getCallee()->getName() << " global "
+                         << kv.first->getName() << "\n");
 
 #if 0
     if (flowSensitiveOpt)
@@ -87,6 +90,9 @@ void TopDownAnalysis::cloneAndResolveArguments(const DsaCallSite &cs,
     const Value *fml = &*FI;
 
     if (!callerG.hasCell(*arg) || !calleeG.hasCell(*fml)) continue;
+    LOG("dsa-nd", errs() << "TD " << cs.getCaller()->getName() << " -> "
+                         << cs.getCallee()->getName() << " formal "
+                         << fml->getName() << "\n");
 
     // Actuals that directly correspond to globals should only
     // propagate a single allocation site, regardless of the

@@ -71,6 +71,8 @@ Node &Cloner::clone(const Node &n, bool forceAddAlloca,
       assert(!nodeSet.empty());
 
       Node *first = *nodeSet.begin();
+      LOG("dsa-nd", llvm::errs() << "cloner deferred-unify src=N" << n.getId()
+                                 << " count=" << nodeSet.size() << "\n");
       for (Node *split : nodeSet)
         if (split != first) {
           split->getNode()->unify(*first->getNode());

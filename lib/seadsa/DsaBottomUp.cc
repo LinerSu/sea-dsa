@@ -66,6 +66,9 @@ void BottomUpAnalysis::cloneAndResolveArguments(
 
   // clone and unify globals
   for (auto &kv : calleeG.globals()) {
+    LOG("dsa-nd", errs() << "BU " << CS.getCaller()->getName() << " <- "
+                         << CS.getCallee()->getName() << " global "
+                         << kv.first->getName() << "\n");
     Node &calleeN = *kv.second->getNode();
     // We don't care if globals got unified together, but have to respect the
     // points-to relations introduced by the callee introduced.
@@ -120,6 +123,9 @@ void BottomUpAnalysis::cloneAndResolveArguments(
        ++FI, ++AI) {
     const Value *arg = (*AI).get();
     const Value *fml = &*FI;
+    LOG("dsa-nd", errs() << "BU " << CS.getCaller()->getName() << " <- "
+                         << CS.getCallee()->getName() << " formal "
+                         << fml->getName() << "\n");
     if (calleeG.hasCell(*fml)) {
       const Cell &formalC = calleeG.getCell(*fml);
       Node &n = C.clone(*formalC.getNode());
