@@ -424,6 +424,16 @@ void Node::pointTo(Node &node, const Offset &offset) {
 
   // -- merge all the collapsed interval cells
   if (seadsa::g_IsPartialCollapseEnabled) {
+    // The target's size is only grown through joinAccessedTypes above, but a
+    // partial collapse strips the accessed types inside its interval. Without
+    // this, a node carrying [0,e] merged into a fresh (sz=0) node makes
+    // partialCollapseOffsets see e > m_size and degrade to a full collapse,
+    // whereas merging in the opposite direction keeps the interval -- i.e.
+    // the result depended on which node was chosen as representative.
+    Node &target = *node.getNode();
+    if (!m_collapsedCells.empty() && !target.isOffsetCollapsed() &&
+        !target.isArray())
+      target.growSize(noffset + m_size);
     node.joinCollapsedCells(*this, offset);
   }
 
