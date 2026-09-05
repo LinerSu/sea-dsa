@@ -108,7 +108,7 @@ ByteRange accessRange(const Cell &c, LocationSize sz, const DataLayout &dl) {
     }
   }
   // widen to any collapsed interval overlapping the access
-  for (const Cell &ck : n->getCollapsedCells()) {
+  for (const auto &ck : n->getCollapsedCells()) { // Cell (I-DSA) or Chunk
     const unsigned s = ck.getStartOffset();
     const auto e = ck.getEndOffset(); // none = +oo
     const bool overlaps =

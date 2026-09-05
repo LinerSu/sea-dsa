@@ -441,13 +441,22 @@ void DsaInfo::dumpPointerCells(Module &M, llvm::raw_ostream &o) {
     if (!n) return;
     const unsigned raw = c.getRawOffset();
     bool inInterval = false;
-    for (const Cell &ck : n->getCollapsedCells()) {
+    // I-DSA: interval Cells; classic build: Chunks. Both have includes().
+    for (const auto &ck : n->getCollapsedCells()) {
       if (ck.includes(raw)) { inInterval = true; break; }
     }
+#ifdef SEA_BUILD_IDSA
+    const unsigned start = c.getStartOffset();
+    const boost::optional<unsigned> end = c.getEndOffset();
+#else
+    // classic cells are singletons
+    const unsigned start = c.getOffset();
+    const boost::optional<unsigned> end = c.getOffset();
+#endif
     std::string name = v.hasName() ? v.getName().str() : "<unnamed>";
     o << f.getName() << "," << name << "," << getDsaNodeId(*n) << "," << raw
-      << "," << c.getStartOffset() << ",";
-    if (auto e = c.getEndOffset()) o << e.get(); else o << "inf";
+      << "," << start << ",";
+    if (end) o << end.get(); else o << "inf";
     o << "," << n->isOffsetCollapsed() << "," << n->isTypeCollapsed() << ","
       << n->isArray() << "," << n->isPartialCollapsed() << "," << inInterval
       << "," << n->getAllocSites().size() << "," << n->isIntToPtr() << ","

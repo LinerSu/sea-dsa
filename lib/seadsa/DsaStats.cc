@@ -67,9 +67,13 @@ static void printMemUsageInfo(nodes_range nodes, llvm::raw_ostream &o) {
   std::vector<NodeInfo> sorted_nodes(nodes.begin(), nodes.end());
   unsigned int summ_size = NodeSummarySize;
   o << "\tSummary of the " << summ_size << " nodes with more accesses:\n";
+  // Break ties by node id: the input order comes from a pointer-keyed map,
+  // so without it the listing of equally-accessed nodes changes across runs.
   std::sort(sorted_nodes.begin(), sorted_nodes.end(),
             [](const NodeInfo &n1, const NodeInfo &n2) {
-              return (n1.getAccesses() > n2.getAccesses());
+              if (n1.getAccesses() != n2.getAccesses())
+                return (n1.getAccesses() > n2.getAccesses());
+              return n1.getId() < n2.getId();
             });
 
   if (total_accesses > 0) {
@@ -134,7 +138,11 @@ static void printGraphInfo(nodes_range nodes, llvm::raw_ostream &o) {
       << " average number of node links (graph fan-out)\n";
     o << "\t" << num_max_links << " maximum number of links of a given node\n";
     o << "\tLinks in each node:\n";
-    for (const auto &n : nodes) {
+    // `nodes` is iterated in the order of a pointer-keyed map: list the
+    // nodes by id so that the output does not change across runs.
+    std::vector<NodeInfo> nodes_by_id(nodes.begin(), nodes.end());
+    std::sort(nodes_by_id.begin(), nodes_by_id.end());
+    for (const auto &n : nodes_by_id) {
       if (n.getNode()->getNumLinks() == 0) {
         continue;
       }
