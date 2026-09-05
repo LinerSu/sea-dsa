@@ -1724,15 +1724,12 @@ void Graph::import(const Graph &g, bool withFormals) {
   Cloner C(*this, CloningContext::mkNoContext(), Cloner::Options::Basic);
   for (auto &kv : g.m_values) {
     LOG("dsa-nd", errs() << "import value " << kv.first->getName() << "\n");
-    // -- clone node
-    Node *n = nullptr;
+    // -- clone node and re-create the cell
+    Cell c;
     {
       SEADSA_SCOPED_STATS("interval_graph.import.values.clone", 1);
-      n = &C.clone(*kv.second->getNode());
+      c = C.cloneCell(*kv.second);
     }
-
-    // -- re-create the cell
-    Cell c(*n, kv.second->getRawOffset());
 
     // -- insert value
     Cell *nc = nullptr;
@@ -1750,12 +1747,11 @@ void Graph::import(const Graph &g, bool withFormals) {
 
   if (withFormals) {
     for (auto &kv : g.m_formals) {
-      Node *n = nullptr;
+      Cell c;
       {
         SEADSA_SCOPED_STATS("interval_graph.import.formals.clone", 1);
-        n = &C.clone(*kv.second->getNode());
+        c = C.cloneCell(*kv.second);
       }
-      Cell c(*n, kv.second->getRawOffset());
       Cell *nc = nullptr;
       {
         SEADSA_SCOPED_STATS("interval_graph.import.formals.mkcell", 1);
@@ -1767,12 +1763,11 @@ void Graph::import(const Graph &g, bool withFormals) {
       }
     }
     for (auto &kv : g.m_returns) {
-      Node *n = nullptr;
+      Cell c;
       {
         SEADSA_SCOPED_STATS("interval_graph.import.returns.clone", 1);
-        n = &C.clone(*kv.second->getNode());
+        c = C.cloneCell(*kv.second);
       }
-      Cell c(*n, kv.second->getRawOffset());
       Cell *nc = nullptr;
       {
         SEADSA_SCOPED_STATS("interval_graph.import.returns.mkretcell", 1);

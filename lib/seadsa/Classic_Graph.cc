@@ -1642,11 +1642,8 @@ bool Graph::computeSimulationMapping(Graph &fromG, Graph &toG,
 void Graph::import(const Graph &g, bool withFormals) {
   Cloner C(*this, CloningContext::mkNoContext(), Cloner::Options::Basic);
   for (auto &kv : g.m_values) {
-    // -- clone node
-    Node &n = C.clone(*kv.second->getNode());
-
-    // -- re-create the cell
-    Cell c(n, kv.second->getRawOffset());
+    // -- clone node and re-create the cell
+    Cell c = C.cloneCell(*kv.second);
 
     // -- insert value
     Cell &nc = mkCell(*kv.first, Cell());
@@ -1657,14 +1654,12 @@ void Graph::import(const Graph &g, bool withFormals) {
 
   if (withFormals) {
     for (auto &kv : g.m_formals) {
-      Node &n = C.clone(*kv.second->getNode());
-      Cell c(n, kv.second->getRawOffset());
+      Cell c = C.cloneCell(*kv.second);
       Cell &nc = mkCell(*kv.first, Cell());
       nc.unify(c);
     }
     for (auto &kv : g.m_returns) {
-      Node &n = C.clone(*kv.second->getNode());
-      Cell c(n, kv.second->getRawOffset());
+      Cell c = C.cloneCell(*kv.second);
       Cell &nc = mkRetCell(*kv.first, Cell());
       nc.unify(c);
     }

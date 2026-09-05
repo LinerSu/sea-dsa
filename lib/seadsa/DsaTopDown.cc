@@ -62,9 +62,8 @@ void TopDownAnalysis::cloneAndResolveArguments(const DsaCallSite &cs,
 #endif
 
     // Copy only the allocation site that matches the global.
-    Node &n = C.clone(*kv.second->getNode(), false,
-                      (!flowSensitiveOpt ? nullptr : kv.first));
-    Cell c(n, kv.second->getRawOffset());
+    Cell c = C.cloneCell(*kv.second, false,
+                         (!flowSensitiveOpt ? nullptr : kv.first));
     Cell &nc = calleeG.mkCell(*kv.first, Cell());
     nc.unify(c);
   }
@@ -74,8 +73,7 @@ void TopDownAnalysis::cloneAndResolveArguments(const DsaCallSite &cs,
   if (calleeG.hasRetCell(callee) && callerG.hasCell(*cs.getInstruction())) {
     auto &inst = *cs.getInstruction();
     const Cell &csCell = callerG.getCell(inst);
-    Node &n = C.clone(*csCell.getNode());
-    Cell c(n, csCell.getRawOffset());
+    Cell c = C.cloneCell(csCell);
     Cell &nc = calleeG.getRetCell(callee);
     nc.unify(c);
   }
@@ -104,8 +102,7 @@ void TopDownAnalysis::cloneAndResolveArguments(const DsaCallSite &cs,
     }
 
     const Cell &callerCell = callerG.getCell(*arg);
-    Node &n = C.clone(*callerCell.getNode(), noescape, onlyAllocSite);
-    Cell c(n, callerCell.getRawOffset());
+    Cell c = C.cloneCell(callerCell, noescape, onlyAllocSite);
     Cell &nc = calleeG.mkCell(*fml, Cell());
     nc.unify(c);
 

@@ -144,22 +144,47 @@ Node &Cloner::clone(const Node &n, bool forceAddAlloca,
     if (kv.second->isNull())
       continue;
 
-    const unsigned rawOffset = kv.second->getRawOffset();
     // TODO: When we are running with a single allocation site, we can check
     //       if it can possibly point to somewhere at the current offset and
     //       avoid some cloning.
 
-    // -- resolve any potential forwarding
-    kv.second->getNode();
-    // recursively clone the node pointed by the link
-    Cell nCell(&clone(*kv.second->getNode()), rawOffset);
-    // create new link
+    // recursively clone the node pointed by the link and create the new
+    // link. cloneCell resolves forwarding in the source graph and keeps the
+    // offset at which an already cloned target has been embedded meanwhile.
+    Cell nCell = cloneCell(*kv.second);
     nNode.setLink(kv.first, nCell);
   }
 
   // nNode can be forwarding if the original node was collapsed and the new one
   // was initially split into multiple onlyAllocSites.
   return *nNode.getNode();
+}
+
+Cell Cloner::cloneCell(const Cell &c, bool forceAddAlloca,
+                       const llvm::Value *onlyAllocSite) {
+  assert(!c.isNull());
+  // -- resolve any potential forwarding in the source graph
+  const Node &orig = *c.getNode();
+  const unsigned rawOffset = c.getRawOffset();
+
+  Node &rep = clone(orig, forceAddAlloca, onlyAllocSite);
+
+  // clone() returns the representative of the (cached) clone. If that clone
+  // has already been unified into another node at a non-zero offset -- e.g.
+  // by the unification of an earlier formal of the same call site, or of an
+  // earlier value of the same import -- the representative alone does not
+  // carry the shift: Cell(rep, rawOffset) would name the wrong field, and a
+  // later unification with the right one either collapses the node (classic
+  // DSA) or creates a spurious interval (I-DSA). Build the cell from the
+  // cached clone instead and let Cell::getNode() resolve the forwarding
+  // chain, which adds the embedding offset.
+  Node *base = &rep;
+  auto it = m_map.find(&orig);
+  if (it != m_map.end()) base = it->second.first;
+  Cell res(base, rawOffset);
+  res.getNode();
+  assert(res.getNode() == rep.getNode());
+  return res;
 }
 
 void Cloner::copyAllocationSites(

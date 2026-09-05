@@ -69,18 +69,18 @@ void BottomUpAnalysis::cloneAndResolveArguments(
     LOG("dsa-nd", errs() << "BU " << CS.getCaller()->getName() << " <- "
                          << CS.getCallee()->getName() << " global "
                          << kv.first->getName() << "\n");
-    Node &calleeN = *kv.second->getNode();
     // We don't care if globals got unified together, but have to respect the
     // points-to relations introduced by the callee introduced.
 #if 0
+    Node &calleeN = *kv.second->getNode();
     if (flowSensitiveOpt)
       if (calleeN.getNumLinks() == 0 || !calleeN.isModified() ||
           llvm::isa<ConstantData>(kv.first))
         continue;
 #endif
 
-    Node &n = C.clone(calleeN, false, (!flowSensitiveOpt ? nullptr : kv.first));
-    Cell c(n, kv.second->getRawOffset());
+    Cell c = C.cloneCell(*kv.second, false,
+                         (!flowSensitiveOpt ? nullptr : kv.first));
     Cell &nc = callerG.mkCell(*kv.first, Cell());
     nc.unify(c);
   }
@@ -102,8 +102,7 @@ void BottomUpAnalysis::cloneAndResolveArguments(
     }
 
     const Cell &ret = calleeG.getRetCell(callee);
-    Node &n = C.clone(*ret.getNode(), false, onlyAllocSite);
-    Cell c(n, ret.getRawOffset());
+    Cell c = C.cloneCell(ret, false, onlyAllocSite);
     nc.unify(c);
 
     // Unify the cloned global with the global in the caller graph.
@@ -128,9 +127,8 @@ void BottomUpAnalysis::cloneAndResolveArguments(
                          << fml->getName() << "\n");
     if (calleeG.hasCell(*fml)) {
       const Cell &formalC = calleeG.getCell(*fml);
-      Node &n = C.clone(*formalC.getNode());
-      n.setExternal(false);
-      Cell c(n, formalC.getRawOffset());
+      Cell c = C.cloneCell(formalC);
+      c.getNode()->setExternal(false);
       Cell &nc = callerG.mkCell(*arg, Cell());
       nc.unify(c);
     }

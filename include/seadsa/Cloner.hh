@@ -47,6 +47,16 @@ public:
   Node &clone(const Node &n, bool forceAddAlloca = false,
               const llvm::Value *onlyAllocSite = nullptr);
 
+  /// Returns the cell of the new graph that corresponds to cell c of the
+  /// source graph: the clone of c's node at c's raw offset. Unlike
+  /// Cell(clone(*c.getNode()), c.getRawOffset()), this accounts for the
+  /// clone having been unified into another node at a non-zero offset since
+  /// it was created (e.g. by an earlier formal/actual unification of the same
+  /// call site): the cached clone's forwarding cell carries that shift and it
+  /// is added to the offset.
+  Cell cloneCell(const Cell &c, bool forceAddAlloca = false,
+                 const llvm::Value *onlyAllocSite = nullptr);
+
   /// Returns a cloned node that corresponds to the given node
   Node &at(const Node &n) {
     assert(hasNode(n));

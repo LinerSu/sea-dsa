@@ -109,10 +109,8 @@ static void resolveIndirectCallsThroughBitCast(Function &F, CallGraph &seaCg) {
 void CompleteCallGraphAnalysis::mergeGraphs(Graph &fromG, Graph &toG) {
   Cloner C(toG, CloningContext::mkNoContext(), Cloner::Options::Basic);
   for (auto &kv : fromG.globals()) {
-    // -- clone node
-    Node &n = C.clone(*kv.second->getNode());
-    // -- re-create the cell
-    Cell c(n, kv.second->getRawOffset());
+    // -- clone node and re-create the cell
+    Cell c = C.cloneCell(*kv.second);
     // -- insert value
     Cell &nc = toG.mkCell(*kv.first, Cell());
     // -- unify the old and new cells
@@ -120,14 +118,12 @@ void CompleteCallGraphAnalysis::mergeGraphs(Graph &fromG, Graph &toG) {
   }
 
   for (auto &kv : fromG.formals()) {
-    Node &n = C.clone(*kv.second->getNode());
-    Cell c(n, kv.second->getRawOffset());
+    Cell c = C.cloneCell(*kv.second);
     Cell &nc = toG.mkCell(*kv.first, Cell());
     nc.unify(c);
   }
   for (auto &kv : fromG.returns()) {
-    Node &n = C.clone(*kv.second->getNode());
-    Cell c(n, kv.second->getRawOffset());
+    Cell c = C.cloneCell(*kv.second);
     Cell &nc = toG.mkRetCell(*kv.first, Cell());
     nc.unify(c);
   }
@@ -188,18 +184,17 @@ void CompleteCallGraphAnalysis::cloneAndResolveArgumentsAndCallSites(
 
   // clone and unify globals
   for (auto &kv : calleeG.globals()) {
-    Node &calleeN = *kv.second->getNode();
     // We don't care if globals got unified together, but have to respect the
     // points-to relations introduced by the callee introduced.
 #if 0
+    Node &calleeN = *kv.second->getNode();
     if (!NoBUFlowSensitiveOpt)
       if (calleeN.getNumLinks() == 0 || !calleeN.isModified() ||
           llvm::isa<ConstantData>(kv.first))
         continue;
 #endif
 
-    Node &n = C.clone(calleeN, false, kv.first);
-    Cell c(n, kv.second->getRawOffset());
+    Cell c = C.cloneCell(*kv.second, false, kv.first);
     Cell &nc = callerG.mkCell(*kv.first, Cell());
     nc.unify(c);
   }
@@ -218,8 +213,7 @@ void CompleteCallGraphAnalysis::cloneAndResolveArgumentsAndCallSites(
     }
 
     const Cell &ret = calleeG.getRetCell(callee);
-    Node &n = C.clone(*ret.getNode(), false, onlyAllocSite);
-    Cell c(n, ret.getRawOffset());
+    Cell c = C.cloneCell(ret, false, onlyAllocSite);
     nc.unify(c);
 
     if (onlyAllocSite) {
@@ -239,8 +233,7 @@ void CompleteCallGraphAnalysis::cloneAndResolveArgumentsAndCallSites(
     const Value *fml = &*FI;
     if (calleeG.hasCell(*fml)) {
       const Cell &formalC = calleeG.getCell(*fml);
-      Node &n = C.clone(*formalC.getNode());
-      Cell c(n, formalC.getRawOffset());
+      Cell c = C.cloneCell(formalC);
       Cell &nc = callerG.mkCell(*arg, Cell());
       nc.unify(c);
     }
