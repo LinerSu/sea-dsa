@@ -404,8 +404,9 @@ void Node::pointTo(Node &node, const Offset &offset) {
   assert(!isForwarding());
 
   LOG("dsa-forward", errs() << "Forwarding links from " << this << " to "
-                            << &node << " at offset "
-                            << offset.getNumericOffset() << "\n";);
+                            << &node << " at offset " << offset.getRawOffset()
+                            << " (canonical " << offset.getNumericOffset()
+                            << ")\n";);
 
   // -- reset unique scalar at the destination
   if (offset.getNumericOffset() != 0) node.setUniqueScalar(nullptr);
@@ -425,7 +426,19 @@ void Node::pointTo(Node &node, const Offset &offset) {
 
   // -- create forwarding link
   /// This handles move incoming edges of @param node to @param thisnode
-  m_forward.pointTo(node, offset.getNumericOffset());
+  //
+  // The forwarding cell must carry the RAW embedding offset b: only the
+  // node-shape adjustments (offset-collapsed -> 0, array -> b % size) are
+  // applied, by Cell::pointTo. Every field, link and collapsed interval of
+  // this node is then relocated to b + f below, and each resulting offset is
+  // canonicalised individually by the target (joinAccessedTypes/addLink go
+  // through Node::Offset, so b + f inside an interval [s,e] reads as s while
+  // b + f beyond e stays put). Likewise a cell (this, f) resolved through the
+  // forward chain (Cell::getNode) yields the raw (node, b + f), which
+  // Cell::getOffset() canonicalises. Passing offset.getNumericOffset() here
+  // would snap b itself to s when b lies inside an interval of `node`, and
+  // shift ALL of this node's fields left by (b - s).
+  m_forward.pointTo(node, offset.getRawOffset());
   // -- get updated offset based on how forwarding was resolved
   unsigned noffset = m_forward.getRawOffset();
   // -- at this point, current node is being embedded at noffset
@@ -456,9 +469,10 @@ void Node::pointTo(Node &node, const Offset &offset) {
     Node &target = *node.getNode();
     if (!intervals.empty() && !target.isOffsetCollapsed() && !target.isArray())
       target.growSize(noffset + m_size);
-    // Use the resolved raw embedding offset (noffset), not
-    // offset.getNumericOffset(): the latter is re-canonicalized through the
-    // target's collapsed cells, which the joins below are modifying.
+    // Use the raw embedding offset (noffset), not offset.getNumericOffset():
+    // the latter is canonicalized through the target's collapsed cells, which
+    // the joins below are modifying; partialCollapseOffsets canonicalizes each
+    // shifted interval itself.
     node.joinCollapsedCells(intervals, noffset);
   }
 
@@ -1144,7 +1158,9 @@ boost::optional<unsigned> Cell::getRawEndOffset() const {
 }
 
 unsigned Cell::getOffset() const {
-  // -- adjust the offset based on the kind of node
+  // -- adjust the offset based on the kind of node. This is the only place
+  // -- where a cell's raw offset is canonicalised through the node's
+  // -- collapsed intervals (see the invariant in Cell::pointTo).
   if (isNull() || getNode()->isOffsetCollapsed())
     return 0;
   else if (getNode()->isArray())
@@ -1193,11 +1209,18 @@ void Cell::pointTo(Node &n, unsigned start, boost::optional<unsigned> end) {
     /// grow size as needed. allow offset to go one byte past size
     if (start < n.size()) n.growSize(start);
     if (end && end.get() < n.size()) n.growSize(end.get());
-    auto &cells = m_node->getCollapsedCells();
-    auto it = std::find_if(cells.begin(), cells.end(), [start](const auto &c) {
-      return c.includes(start);
-    });
-    m_offset = (it != cells.end()) ? it->getOffset() : start;
+    // Invariant: a cell stores its RAW offset. Canonicalisation through the
+    // node's collapsed intervals (an offset inside [s,e] reads as s) happens
+    // only at resolution time -- Cell::getOffset() for cells,
+    // Node::Offset::getNumericOffset() for node-internal offsets -- never at
+    // construction. Snapping here would be wrong for the forwarding cell of
+    // an embedded node (Node::pointTo): that cell is a translation, and every
+    // field f of the embedded node must be relocated to base + f and only
+    // then canonicalised individually; fields beyond the interval end must
+    // not be shifted left by (base - s). Intervals only widen, so a raw
+    // offset inside an interval keeps resolving to the same start: nothing
+    // is lost by deferring.
+    m_offset = start;
     m_end = end;
   }
 }

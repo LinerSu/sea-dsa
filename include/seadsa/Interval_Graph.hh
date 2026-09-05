@@ -961,6 +961,9 @@ protected:
      */
     unsigned getNumericOffset() const;
 
+    /// @brief The raw (un-canonicalised) offset this wrapper was built from.
+    unsigned getRawOffset() const { return m_offset; }
+
     /**
      * @brief Get a field with adjusted offset
      * @param f The field
