@@ -925,7 +925,7 @@ toUnsignedArraySize(std::optional<uint64_t> arraySize) {
 
 /**
    Computes an offset of a gep instruction for a given source element type
-   and a sequence of indicies.
+   and a sequence of indices.
 
    GepOffset::noffset is the fixed offset. GepOffset::stride is a gcd of the
    variable offset. GepOffset::arraySize is the first statically-known nonzero
