@@ -2,7 +2,12 @@
 // seadsda -- Print heap graphs and call graph computed by sea-dsa
 ///
 
+#include "llvm/ADT/SetVector.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/CallPrinter.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -74,6 +79,20 @@ static llvm::cl::opt<bool>
                "Exhaustive Alias Analaysis Precision Evaluation using seadsa"),
            llvm::cl::init(false));
 
+static llvm::cl::opt<bool> AAPairs(
+    "sea-dsa-aa-pairs",
+    llvm::cl::desc("Print the alias verdict of every pair of pointer values of "
+                   "each function (AliasAnalysisEvaluator's pointer universe, "
+                   "sizes and line format; alias queries only, no mod/ref)"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> NoSeaDsaAA(
+    "sea-dsa-no-aa",
+    llvm::cl::desc("Do not register sea-dsa's alias analysis and do not "
+                   "rewrite ptrtoint/inttoptr: alias queries are answered "
+                   "by LLVM's BasicAA on the module as read"),
+    llvm::cl::init(false));
+
 namespace seadsa {
 SeaDsaLogOpt loc;
 extern bool PrintDsaStats;
@@ -98,6 +117,109 @@ static std::string withDir(const std::string &outdir, const std::string &path) {
   }
   return path;
 }
+
+namespace {
+/// Alias verdicts of every pair of pointer values of a function.
+///
+/// Same pointer universe (arguments, pointer-typed instructions, pointer
+/// operands; callee operands of indirect calls), same pair order, same
+/// memory-location sizes and same per-pair output line as LLVM's
+/// AliasAnalysisEvaluator (-aa-eval -print-all-alias-modref-info), so its
+/// output can be consumed by the same parsers. Unlike the evaluator it asks
+/// alias questions only (no mod/ref queries per call site, no call-site pairs)
+/// and computes each value's operand string once instead of printing both
+/// values of every pair through the IR printer.
+class AliasPairsPass : public llvm::FunctionPass {
+public:
+  static char ID;
+  AliasPairsPass() : llvm::FunctionPass(ID) {}
+  void getAnalysisUsage(llvm::AnalysisUsage &AU) const override {
+    AU.addRequired<llvm::AAResultsWrapperPass>();
+    AU.setPreservesAll();
+  }
+  llvm::StringRef getPassName() const override { return "sea-dsa alias pairs"; }
+  bool runOnFunction(llvm::Function &F) override;
+};
+char AliasPairsPass::ID = 0;
+
+// AliasAnalysisEvaluator::isInterestingPointer
+static bool isInterestingPointer(llvm::Value *V) {
+  return V->getType()->isPointerTy() && !llvm::isa<llvm::ConstantPointerNull>(V);
+}
+
+bool AliasPairsPass::runOnFunction(llvm::Function &F) {
+  using namespace llvm;
+  AAResults &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+  const DataLayout &DL = F.getParent()->getDataLayout();
+
+  // -- the pointer universe, in AliasAnalysisEvaluator's insertion order
+  SetVector<Value *> Pointers;
+  unsigned nCalls = 0;
+  for (auto &A : F.args())
+    if (A.getType()->isPointerTy()) Pointers.insert(&A);
+  for (Instruction &I : instructions(F)) {
+    if (I.getType()->isPointerTy()) Pointers.insert(&I);
+    if (auto *Call = dyn_cast<CallBase>(&I)) {
+      Value *Callee = Call->getCalledOperand();
+      if (!isa<Function>(Callee) && isInterestingPointer(Callee))
+        Pointers.insert(Callee);
+      for (Use &DataOp : Call->data_ops())
+        if (isInterestingPointer(DataOp)) Pointers.insert(DataOp);
+      ++nCalls;
+    } else {
+      for (Use &Op : I.operands())
+        if (isInterestingPointer(Op)) Pointers.insert(Op);
+    }
+  }
+
+  // -- operand strings ("<type> <operand>", as printAsOperand(os, true, M))
+  //    and memory-location sizes, once per value
+  std::vector<std::string> names;
+  std::vector<LocationSize> sizes;
+  names.reserve(Pointers.size());
+  sizes.reserve(Pointers.size());
+  for (Value *V : Pointers) {
+    std::string s;
+    raw_string_ostream os(s);
+    V->getType()->print(os);
+    os << ' ';
+    V->printAsOperand(os, /*PrintType=*/false, F.getParent());
+    names.push_back(os.str());
+    Type *ElTy = V->getType()->getPointerElementType();
+    sizes.push_back(ElTy->isSized()
+                        ? LocationSize::precise(DL.getTypeStoreSize(ElTy))
+                        : LocationSize::afterPointer());
+  }
+
+  // -- every unordered pair, later value first, as the evaluator does
+  std::string out;
+  raw_string_ostream os(out);
+  os << "Function: " << F.getName() << ": " << Pointers.size()
+     << " pointers, " << nCalls << " call sites\n";
+  unsigned nNo = 0, nMay = 0, nPartial = 0, nMust = 0;
+  for (unsigned i = 0, n = Pointers.size(); i < n; ++i) {
+    for (unsigned j = 0; j < i; ++j) {
+      AliasResult AR = AA.alias(Pointers[i], sizes[i], Pointers[j], sizes[j]);
+      switch (AR) {
+      case AliasResult::NoAlias: ++nNo; break;
+      case AliasResult::MayAlias: ++nMay; break;
+      case AliasResult::PartialAlias: ++nPartial; break;
+      case AliasResult::MustAlias: ++nMust; break;
+      }
+      // the evaluator prints the lexicographically smaller operand first
+      const std::string &a = names[i], &b = names[j];
+      const bool swap = b < a;
+      os << "  " << AR << ":\t" << (swap ? b : a) << ", " << (swap ? a : b)
+         << "\n";
+    }
+  }
+  os << "  alias queries: " << (nNo + nMay + nPartial + nMust) << " (NoAlias "
+     << nNo << ", MayAlias " << nMay << ", PartialAlias " << nPartial
+     << ", MustAlias " << nMust << ")\n";
+  llvm::errs() << os.str();
+  return false;
+}
+} // namespace
 
 int main(int argc, char **argv) {
   llvm::llvm_shutdown_obj shutdown; // calls llvm_shutdown() on exit
@@ -175,19 +297,21 @@ int main(int argc, char **argv) {
 
   assert(dl && "Could not find Data Layout for the module");
 
-  pass_manager.add(seadsa::createRemovePtrToIntPass());
+  if (!NoSeaDsaAA) pass_manager.add(seadsa::createRemovePtrToIntPass());
   // ==--== Alias Analysis Passes ==--==/
 
   // -- add to pass manager
   pass_manager.add(seadsa::createDsaLibFuncInfoPass());
-  pass_manager.add(seadsa::createSeaDsaAAWrapperPass());
-  // -- make available through AAResultsWrapperPass via ExternalAAWrapperPass
-  pass_manager.add(llvm::createExternalAAWrapperPass(
-      [](llvm::Pass &P, llvm::Function &, llvm::AAResults &AAR) {
-        if (auto *WrapperPass =
-                P.getAnalysisIfAvailable<seadsa::SeaDsaAAWrapperPass>())
-          AAR.addAAResult(WrapperPass->getResult());
-      }));
+  if (!NoSeaDsaAA) {
+    pass_manager.add(seadsa::createSeaDsaAAWrapperPass());
+    // -- make available through AAResultsWrapperPass via ExternalAAWrapperPass
+    pass_manager.add(llvm::createExternalAAWrapperPass(
+        [](llvm::Pass &P, llvm::Function &, llvm::AAResults &AAR) {
+          if (auto *WrapperPass =
+                  P.getAnalysisIfAvailable<seadsa::SeaDsaAAWrapperPass>())
+            AAR.addAAResult(WrapperPass->getResult());
+        }));
+  }
 
   // XXX Comment other alias analyses for now to make sure that we
   // XXX get to SeaDsa one first. Enable them once there are
@@ -220,21 +344,22 @@ int main(int argc, char **argv) {
       pass_manager.add(seadsa::createDsaCallGraphPrinterPass());
     }
 
-    if (AAEval) {
+    if (AAEval || AAPairs) {
       // Module-pass barrier: without it the legacy pass manager batches the
       // preceding function passes (RemovePtrToInt, ...) with AAEval, so the
       // first alias query builds the whole-module DSA graphs while later
       // functions are still untransformed.
       pass_manager.add(llvm::createBarrierNoopPass());
-      pass_manager.add(llvm::createAAEvalPass());
+      if (AAEval) pass_manager.add(llvm::createAAEvalPass());
+      if (AAPairs) pass_manager.add(new AliasPairsPass());
     }
 
     if (!MemDot && !MemViewer && !seadsa::PrintDsaStats &&
-        !seadsa::PrintCallGraphStats && !CallGraphDot && !AAEval) {
+        !seadsa::PrintCallGraphStats && !CallGraphDot && !AAEval && !AAPairs) {
       llvm::errs() << "No option selected: choose one option between "
                    << "{sea-dsa-dot, sea-dsa-viewer, sea-dsa-stats, "
                    << "sea-dsa-callgraph-dot, sea-dsa-callgraph-stats, "
-                      "sea-dsa-aa-eval}\n";
+                      "sea-dsa-aa-eval, sea-dsa-aa-pairs}\n";
     }
   }
 
