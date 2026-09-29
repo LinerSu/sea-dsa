@@ -2,6 +2,7 @@
 
 #include "seadsa/Graph.hh"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace seadsa {
 
@@ -67,6 +68,14 @@ public:
 
   /// Returns true if the node has already been cloned
   bool hasNode(const Node &n) { return m_map.count(&n) > 0; }
+
+  /// Appends to \p out the nodes of the new graph that node \p n has been
+  /// cloned into so far, without cloning anything: its cached clone and the
+  /// clones split per allocation site (onlyAllocSite) that are not unified
+  /// yet. A node of the new graph is its own clone. Cells built on them with
+  /// n's raw offsets must be resolved with Cell::getNode() (a clone may have
+  /// been unified into another node at a non-zero offset since).
+  void clonesOf(const Node &n, llvm::SmallVectorImpl<Node *> &out) const;
 
 private:
   enum CachingLevel { SingleAllocSite, NoAllocas, Full };

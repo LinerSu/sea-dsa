@@ -60,6 +60,14 @@ class DsaAllocator;
 extern bool g_IsTypeAware;
 /// Global flag controlling whether DSA uses partial offset collapse
 extern bool g_IsPartialCollapseEnabled;
+/// Global flag (--sea-dsa-partial-collapse-closure, default on) selecting the
+/// closed I-DSA model when partial collapse is enabled: graphs are closed
+/// under pointer arithmetic (closeUnderPointerArithmetic, Local.hh) and a
+/// sequence (array) node never carries an interval. Defined in DsaLocal.cc.
+extern bool g_IsPartialCollapseClosureEnabled;
+/// Counts a sequence node collapsed by the closed model (diagnostics only;
+/// printed by --sea-dsa-stats). Defined in DsaLocal.cc.
+void noteSequenceIntervalCollapse();
 
 /// Data structure graph traversal iterator
 template <typename T> class NodeIterator;
@@ -452,6 +460,38 @@ public:
   void removeLinks(Node *n, std::function<bool(const Node *)> pred);
 
   void removeNodes(std::function<bool(const Node *)> pred);
+
+  /**
+   * @brief A pointer-arithmetic rule p = q + offset (+ i * stride) of a callee,
+   * carried into this graph by bottom-up cloning (I-DSA closure, butd-cs).
+   *
+   * The cells are cells of this graph (the cloned cells of the callee's p and
+   * q); closeUnderPointerArithmetic re-checks the rule like the graph's own
+   * sites. compress resolves the cells, remove_dead and removeNodes drop the
+   * rules whose nodes go away, and rules that can no longer fail (collapsed
+   * node, p and q on different nodes) or repeat an earlier one are dropped.
+   */
+  struct CarriedSite {
+    CellRef p; ///< never null
+    CellRef q; ///< never null
+    int64_t offset;
+    uint64_t stride;
+    boost::optional<unsigned> arraySize;
+    /// The callee instruction the rule comes from (logs only).
+    const llvm::Value *inst;
+  };
+  using CarriedSites = std::vector<CarriedSite>;
+
+  CarriedSites &carriedSites() { return m_carriedSites; }
+  const CarriedSites &carriedSites() const { return m_carriedSites; }
+
+private:
+  CarriedSites m_carriedSites;
+
+  /// Resolves the carried rules' cells and drops those that can no longer
+  /// fail, those whose node satisfies \p gone (may be empty) and repeats,
+  /// keeping the first occurrence (deterministic order).
+  void pruneCarriedSites(const std::function<bool(const Node *)> &gone);
 };
 
 /**

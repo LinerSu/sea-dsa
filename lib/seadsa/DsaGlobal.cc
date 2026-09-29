@@ -105,6 +105,9 @@ bool ContextInsensitiveGlobalAnalysis::runOnModule(Module &M) {
     m_graph.reset(new Graph(m_dl, m_setFactory));
 
   LocalAnalysis la(m_dl, m_tliWrapper, m_allocInfo);
+  // -- the functions whose instructions built m_graph, in the order they were
+  // -- analyzed (I-DSA closure)
+  std::vector<const Function *> graphFns;
 
   // -- bottom-up inlining of all graphs
   for (auto it = scc_begin(&m_cg); !it.isAtEnd(); ++it) {
@@ -133,6 +136,7 @@ bool ContextInsensitiveGlobalAnalysis::runOnModule(Module &M) {
         la.runOnFunction(*spec, *fGraph); }
 
       m_fns.insert(spec);
+      graphFns.push_back(spec);
 
       { SEADSA_SCOPED_STATS("ci.global.import", 1);
         m_graph->import(*fGraph, true); }
@@ -164,6 +168,9 @@ bool ContextInsensitiveGlobalAnalysis::runOnModule(Module &M) {
     { SEADSA_SCOPED_STATS("ci.global.compress", 1);
       m_graph->compress(); }
   }
+  // -- I-DSA: the imports and the argument unifications may have grown nodes
+  if (closeUnderPointerArithmetic(*m_graph, m_dl, graphFns, "ci", "global"))
+    m_graph->compress();
   { SEADSA_SCOPED_STATS("ci.global.remove_dead", 1);
     m_graph->remove_dead(); }
 

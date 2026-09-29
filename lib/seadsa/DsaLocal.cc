@@ -38,6 +38,7 @@
 #include "llvm/IR/PatternMatch.h"
 
 #include "seadsa/AllocWrapInfo.hh"
+#include "seadsa/Cloner.hh"
 #include "seadsa/Graph.hh"
 #include "seadsa/TypeUtils.hh"
 #include "seadsa/support/Debug.h"
@@ -64,6 +65,55 @@ static llvm::cl::opt<bool> EnableLazyMemTransfer(
     llvm::cl::desc("Delay processing of memory transfer instructions to a "
                    "separate pass (inline only)"),
     llvm::cl::init(false));
+
+namespace seadsa {
+bool g_IsPartialCollapseClosureEnabled;
+}
+
+static llvm::cl::opt<bool, true> XPartialCollapseClosure(
+    "sea-dsa-partial-collapse-closure",
+    llvm::cl::desc("With --sea-dsa-partial-collapse: after each graph is built "
+                   "(local pass, bottom-up and top-down steps, "
+                   "context-insensitive global graph), re-apply the "
+                   "pointer-arithmetic rules (GEPs, fixed-offset inttoptr, "
+                   "extractvalue/insertvalue fields, lazy memory transfers) "
+                   "with interval widening until the graph is closed under "
+                   "them, keep sequence (array) nodes free of intervals, and "
+                   "bound a symbolic GEP by an array extent only if no "
+                   "symbolic index precedes that array (false: the one-pass "
+                   "construction)"),
+    llvm::cl::location(seadsa::g_IsPartialCollapseClosureEnabled),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> LazyMemTransferByCell(
+    "sea-dsa-lazy-mem-transfer-by-cell",
+    llvm::cl::desc("With --sea-dsa-lazy-mem-transfer: select the source links "
+                   "a memcpy/memmove copies by the byte range of their cells "
+                   "(link keys are canonical: interval start, 0 on a "
+                   "collapsed node, modulo the stride on a sequence node), and "
+                   "unify source and destination as the eager rule does when "
+                   "the source window has no unique placement (source inside "
+                   "an interval, on a collapsed node, or across elements of a "
+                   "sequence node) (false: copy the links whose key lies in "
+                   "[raw source offset, + size))"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> CarryCalleeSites(
+    "sea-dsa-partial-collapse-callee-sites",
+    llvm::cl::desc("With the closed I-DSA model: carry the pointer-arithmetic "
+                   "rules of a callee into its callers when bottom-up cloning "
+                   "clones the callee's graph, so that the callers' closures "
+                   "re-check them (butd-cs; kept through top-down)"),
+    llvm::cl::init(true));
+
+namespace {
+/// True if the closed I-DSA model is selected (--sea-dsa-partial-collapse and
+/// --sea-dsa-partial-collapse-closure).
+bool isClosedModel() {
+  return seadsa::g_IsPartialCollapseEnabled &&
+         seadsa::g_IsPartialCollapseClosureEnabled;
+}
+} // namespace
 
 /*****************************************************************************/
 /* HELPERS                                                                   */
@@ -185,6 +235,17 @@ struct GepOffset {
   Optional<int64_t> lower;
   Optional<int64_t> upper;
   Optional<uint64_t> arraySize;
+  /// A symbolic index precedes the first array on the type path (e.g. the
+  /// pointer-level index of p[i].buf[j] written as one GEP): arraySize does
+  /// not bound the symbolic part of the offset.
+  bool symbolicBeforeArray = false;
+
+  /// The array extent that bounds the symbolic part of the offset: arraySize
+  /// if every symbolic index lies at the level of that array or deeper.
+  Optional<uint64_t> boundingArraySize() const {
+    if (symbolicBeforeArray) return None;
+    return arraySize;
+  }
 };
 
 GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
@@ -1022,7 +1083,9 @@ toUnsignedArraySize(Optional<uint64_t> arraySize) {
    inclusive byte-offset bounds when they can be represented as int64_t. None
    means -infinity for lower or +infinity for upper. GepOffset::arraySize is
    the first statically-known nonzero array extent in bytes along the GEP type
-   path, if any.
+   path, if any; GepOffset::symbolicBeforeArray records whether a symbolic
+   index comes before that array (then the extent bounds nothing, see
+   GepOffset::boundingArraySize).
  */
 GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
                            const DataLayout &dl) {
@@ -1038,6 +1101,8 @@ GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
   Optional<int64_t> lower = 0;
   Optional<int64_t> upper = 0;
   Optional<uint64_t> arraySize = None;
+  // -- a symbolic index seen before the first array (see GepOffset)
+  bool symbolicBeforeArray = false;
 
   Type *srcElemTy = cast<PointerType>(ptrTy)->getElementType();
   generic_gep_type_iterator<Value *const *> TI =
@@ -1126,6 +1191,9 @@ GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
         noffset += (uint64_t)arrayIdx * sz;
         addScaledRange(lower, upper, arrayIdx, arrayIdx, sz);
       } else {
+        // -- the extent of an array (recorded above when this level is the
+        // -- first array) bounds only the indices at its level or deeper
+        if (!arraySize) symbolicBeforeArray = true;
         // otherwise, computes gcd of variable offset since idx is var for accessing array
         divisor = divisor == 0 ? sz : gcd(divisor, sz);
         if (sz != 0) {
@@ -1165,9 +1233,11 @@ GepOffset computeGepOffset(Type *ptrTy, ArrayRef<Value *> Indicies,
       if (lower) errs() << *lower; else errs() << "-oo"; errs() << ", ";
       if (upper) errs() << *upper; else errs() << "+oo";
       errs() << "], array-size="; if (arraySize) errs() << *arraySize;
-      else errs() << "none"; errs() << "\n";);
+      else errs() << "none";
+      if (symbolicBeforeArray) errs() << " (symbolic index before the array)";
+      errs() << "\n";);
 
-  return {noffset, divisor, lower, upper, arraySize};
+  return {noffset, divisor, lower, upper, arraySize, symbolicBeforeArray};
 }
 
 /// Computes offset into an indexed type
@@ -1304,14 +1374,20 @@ void BlockBuilderBase::visitGep(const Value &gep, const Value &ptr,
   if (off.stride) { // array with common divisor for computing new size
     // create a node representing the array
     seadsa::Node &n = m_graph.mkNode();
-    boost::optional<unsigned> arraySize = toUnsignedArraySize(off.arraySize);
+    // -- the closed I-DSA model takes the extent only when it bounds every
+    // -- symbolic index; the one-pass model takes the first array's extent
+    const Optional<uint64_t> extent =
+        isClosedModel() ? off.boundingArraySize() : off.arraySize;
+    boost::optional<unsigned> arraySize = toUnsignedArraySize(extent);
     LOG("dsa-array-bound",
         errs() << "gep creates sequence node: stride=" << off.stride
                << ", array-size=";
         if (arraySize)
           errs() << arraySize.get();
+        else if (extent)
+          errs() << *extent << " (too large for unsigned)";
         else if (off.arraySize)
-          errs() << *off.arraySize << " (too large for unsigned)";
+          errs() << "none (symbolic index before the array)";
         else
           errs() << "none";
         errs() << ", noffset=" << off.noffset
@@ -1906,16 +1982,167 @@ bool transfersNoPointers(MemTransferInst &MI, const DataLayout &DL) {
   return true;
 }
 
+/// True if the eager rule (visitMemTransferInstEager) copies nothing for \p I
+/// because, trusting the types, no pointer is transferred.
+bool eagerCopiesNothing(MemTransferInst &I, bool TrustTypes,
+                        const seadsa::Cell &sourceCell, const DataLayout &dl) {
+  return TrustTypes &&
+         ((sourceCell.getNode()->links().size() == 0 &&
+           hasNoPointerTy(I.getSource()->getType()->getPointerElementType())) ||
+          transfersNoPointers(I, dl));
+}
+
+/// The number of bytes a lazy memcpy/memmove copies from its source cell
+/// (the constant length, else the pointee size when source and destination
+/// pointee sizes agree and types are trusted, else the size of the source
+/// node).
+unsigned lazyCopySize(const MemTransferInst &I, bool TrustTypes,
+                      const seadsa::Cell &sourceCell, const DataLayout &dl) {
+  unsigned copySize = sourceCell.getNode()->size(); // default to full size
+  if (auto *len = dyn_cast<ConstantInt>(I.getLength())) {
+    // based on memcpy length
+    copySize = (unsigned)len->getZExtValue();
+  } else if (TrustTypes &&
+             dl.getTypeStoreSize(
+                 I.getSource()->getType()->getPointerElementType()) ==
+                 dl.getTypeStoreSize(
+                     I.getDest()->getType()->getPointerElementType())) {
+    // based on type size if types are trusted and have same size
+    copySize = (unsigned)dl.getTypeStoreSize(
+        I.getSource()->getType()->getPointerElementType());
+  }
+  return copySize;
+}
+
+/// The links a lazy memcpy/memmove copies from the window
+/// [raw(src), raw(src) + size) of its source into its destination.
+struct LazyCopyPlan {
+  /// The window has no unique placement in the source node (the source lies
+  /// inside an interval, on a collapsed node, or the window crosses an element
+  /// of a sequence node): the copy falls back to the eager rule.
+  bool eager = false;
+  struct Link {
+    unsigned lo = 0;     ///< first destination byte, relative to the destination
+    unsigned hi = 0;     ///< last destination byte (hi > lo: an interval cell)
+    unsigned srcKey = 0; ///< canonical source offset of the link
+    seadsa::Field field; ///< the source field (its type is kept)
+    seadsa::Cell target; ///< the link target
+  };
+  SmallVector<Link, 8> links;
+};
+
+/// Selects the links a lazy copy of \p size bytes from \p src transfers.
+/// \p byCell: select them by the byte range of their cells (link keys are
+/// canonical: the start of an interval, 0 on a collapsed node, modulo the
+/// stride on a sequence node); otherwise by their key alone, as the one-pass
+/// construction did.
+LazyCopyPlan planLazyCopy(const seadsa::Cell &src, unsigned size,
+                          bool byCell) {
+  LazyCopyPlan plan;
+  const seadsa::Node &ns = *src.getNode();
+  const unsigned r = src.getRawOffset();
+  if (!byCell) {
+    for (auto &kv : ns.links()) {
+      const unsigned k = kv.first.getOffset();
+      if (k < r || k >= r + size) continue;
+      plan.links.push_back({k - r, k - r, k, kv.first, *kv.second});
+    }
+    return plan;
+  }
+  if (size == 0) return plan;
+  if (ns.isOffsetCollapsed()) {
+    plan.eager = true;
+    return plan;
+  }
+  if (ns.isArray()) {
+    // -- keys are positions modulo the stride; unique placement only if the
+    // -- window lies in one element
+    const unsigned stride = ns.size();
+    if (stride == 0) {
+      plan.eager = true;
+      return plan;
+    }
+    const unsigned base = r % stride;
+    if (static_cast<uint64_t>(base) + size > stride) {
+      plan.eager = true;
+      return plan;
+    }
+    for (auto &kv : ns.links()) {
+      if (kv.second->isNull()) continue;
+      const unsigned k = kv.first.getOffset();
+      if (k < base || k >= base + size) continue;
+      plan.links.push_back({k - base, k - base, k, kv.first, *kv.second});
+    }
+    return plan;
+  }
+  // -- (interval cells; chunks in the classic build)
+  for (const auto &ck : ns.getCollapsedCells()) {
+    if (ck.includes(r)) {
+      plan.eager = true;
+      return plan;
+    }
+  }
+  const uint64_t last = static_cast<uint64_t>(r) + size - 1;
+  for (auto &kv : ns.links()) {
+    if (kv.second->isNull()) continue;
+    const unsigned k = kv.first.getOffset();
+    // -- the byte range of the link's cell: the interval holding k, else k
+    uint64_t lo = k, hi = k;
+    for (const auto &ck : ns.getCollapsedCells()) {
+      if (!ck.includes(k)) continue;
+      lo = ck.getRawStartOffset();
+      auto end = ck.getRawEndOffset();
+      hi = end ? static_cast<uint64_t>(*end)
+               : std::numeric_limits<uint64_t>::max();
+      break;
+    }
+    if (hi < r || lo > last) continue;
+    // -- r lies in no interval, so an interval overlapping the window starts
+    // -- inside it; its image in the destination is clipped to the window
+    const unsigned dlo = static_cast<unsigned>(std::max<uint64_t>(lo, r) - r);
+    const unsigned dhi = static_cast<unsigned>(std::min(hi, last) - r);
+    plan.links.push_back({dlo, dhi, k, kv.first, *kv.second});
+  }
+  return plan;
+}
+
+/// Copies the links of \p plan (not eager) into \p dest: a link whose source
+/// cell is an interval lands on the image of that interval, which becomes an
+/// interval of the destination node. \p src provides the accessed types when
+/// \p copyTypes.
+void applyLazyCopy(const LazyCopyPlan &plan, const seadsa::Cell &src,
+                   seadsa::Cell &dest, bool copyTypes) {
+  assert(!plan.eager);
+  for (const LazyCopyPlan::Link &l : plan.links) {
+    // -- resolve forwarding before the cell's offset is read
+    seadsa::Node *nd = dest.getNode();
+    if (l.hi > l.lo) {
+      const unsigned d = dest.getRawOffset();
+      nd->partialCollapseOffsets(d + l.lo, boost::optional<unsigned>(d + l.hi),
+                                 __LINE__);
+      dest.getNode();
+    }
+    seadsa::Field newField(l.lo, l.field.getType());
+    dest.addLink(newField, l.target);
+    if (!copyTypes) continue;
+    const seadsa::Node *ns = src.getNode();
+    if (ns->hasAccessedType(l.srcKey)) {
+      auto fieldTypes = ns->getAccessedType(l.srcKey);
+      for (const llvm::Type *t : fieldTypes) {
+        dest.getNode();
+        dest.addAccessedType(newField.getOffset(), const_cast<llvm::Type *>(t));
+      }
+    }
+  }
+}
+
 void IntraBlockBuilder::visitMemTransferInstEager(MemTransferInst &I,
                                                   bool TrustTypes,
                                                   seadsa::Cell &sourceCell,
                                                   seadsa::Cell &destCell) {
   // unify the two cells because potentially all bytes of source
   // are copied into dest
-  if (TrustTypes &&
-      ((sourceCell.getNode()->links().size() == 0 &&
-        hasNoPointerTy(I.getSource()->getType()->getPointerElementType())) ||
-       transfersNoPointers(I, m_dl))) {
+  if (eagerCopiesNothing(I, TrustTypes, sourceCell, m_dl)) {
     /* do nothing */
     // no pointers are copied from source to dest, so there is no
     // need to unify them
@@ -1928,6 +2155,20 @@ void IntraBlockBuilder::visitMemTransferInstLazy(MemTransferInst &I,
                                                  bool TrustTypes,
                                                  seadsa::Cell &sourceCell,
                                                  seadsa::Cell &destCell) {
+  if (LazyMemTransferByCell) {
+    const unsigned size = lazyCopySize(I, TrustTypes, sourceCell, m_dl);
+    LazyCopyPlan plan = planLazyCopy(sourceCell, size, true);
+    if (plan.eager) {
+      LOG("dsa-memtransfer", errs() << "Lazy copy of " << size
+                                    << " bytes: the source window has no "
+                                       "unique placement, eager rule\n";);
+      visitMemTransferInstEager(I, TrustTypes, sourceCell, destCell);
+      return;
+    }
+    applyLazyCopy(plan, sourceCell, destCell, true);
+    return;
+  }
+
   unsigned copySize = sourceCell.getNode()->size(); // default to full size
   if (isa<ConstantInt>(I.getLength())) {
     // based on memcpy length
@@ -2243,12 +2484,742 @@ void IntraBlockBuilder::visitPtrToIntInst(PtrToIntInst &I) {
   }
 }
 
+/*****************************************************************************/
+/* PointerArithmeticClosure (I-DSA only)                                     */
+/*****************************************************************************/
+#ifdef SEA_BUILD_IDSA
+/// Closes an I-DSA graph under the pointer-arithmetic rules.
+///
+/// The builders visit every instruction once: a result p = q + c (or
+/// q + c + i*s) gets its cell from q's cell when it is visited and is never
+/// recomputed after q's offset has been absorbed by a collapsed interval. This
+/// class re-applies the rules to the current graph, run after run, until a run
+/// changes nothing. For a site p = q + ...:
+///
+///   I(q) := interval of node(q) holding q's raw offset, else that offset
+///   R    := I(q) + c                                       (constant)
+///           [lo(I(q)) + c, max(lo(I(q)) + c + ext, hi(I(q)) + c)]
+///                                        (symbolic, array extent ext, c >= 0)
+///           [lo(I(q)) + c, +oo]                            (other symbolic)
+///           clamped below at 0, the smallest offset of a node
+///   C(p) := interval of node(p) holding p's raw offset, else that offset
+///
+/// If C(p) does not contain R, the cells overlapping the needed interval are
+/// merged with Node::partialCollapseOffsets (as mergeOrNew does). If C(p) is
+/// already an interval [a,b], it is widened:
+///   [a,b] widen ([a,b] join R) = [lo(R) < a ? 0 : a, hi(R) > b ? +oo : b],
+/// where [0,+oo] collapses the node. A point C(p) becomes R join {raw(p)}.
+///
+/// Collapsed nodes are closed. Sequence (array) nodes carry no interval in the
+/// closed model (Node::partialCollapseOffsets and Cell::unify collapse them
+/// instead), so they are closed modulo their stride; any sequence node that
+/// still carries an interval is collapsed by a safety net. Point-only nodes
+/// are skipped too, except for symbolic GEPs with a negative constant part,
+/// whose symbolic part visitGep drops.
+///
+/// Besides GEPs and fixed-offset inttoptr, two derivations of the local pass
+/// are sites:
+///  - extractvalue/insertvalue of a pointer field: the local pass reads or
+///    writes the link of the field cell raw(agg) + off once; the rule is the
+///    constant one with p = that derived cell, repaired on agg's node;
+///  - lazy memcpy/memmove (--sea-dsa-lazy-mem-transfer): the local pass copies
+///    the source links once; every run re-applies the copy
+///    (planLazyCopy/applyLazyCopy), so links and merges that reach the source
+///    later also reach the destination. A copy only adds links or unifies
+///    cells.
+///
+/// A run is one sweep over the sites in IR order, so a dependency chain
+/// ordered against the sites needs one run per link. After kMaxRuns runs, the
+/// nodes that still violate a rule are collapsed and the copies that are not
+/// closed are unified (eager rule), sweep after sweep, until a sweep finds
+/// nothing; closeUnderPointerArithmetic then warns on stderr.
+class PointerArithmeticClosure {
+public:
+  struct Stats {
+    unsigned sites = 0;     ///< pointer-arithmetic sites with both cells
+    unsigned runs = 0;      ///< closure runs, the last one changes nothing
+    unsigned rechecked = 0; ///< rule evaluations over all runs
+    unsigned repairs = 0;   ///< merges
+    unsigned widened = 0;   ///< merges of an existing interval of p
+    unsigned collapsed = 0; ///< merges that collapsed the whole node
+    unsigned mismatch = 0;  ///< sites whose p and q lie on different nodes
+    unsigned safety = 0;    ///< sequence nodes with an interval, collapsed
+    bool capHit = false;    ///< kMaxRuns was reached
+    unsigned fallbackSweeps = 0; ///< sweeps after kMaxRuns
+    unsigned fallback = 0;  ///< nodes collapsed after kMaxRuns
+    unsigned derived = 0;   ///< extractvalue/insertvalue field sites (in sites)
+    unsigned derivedRepairs = 0; ///< merges of field sites (in repairs)
+    unsigned copies = 0;    ///< lazy memcpy/memmove sites
+    unsigned copyRepairs = 0; ///< re-applied copies that changed the graph
+    unsigned copyUnified = 0; ///< of these: source and destination unified
+    unsigned carried = 0;   ///< callee rules carried into the graph (in sites)
+    unsigned carriedRepairs = 0; ///< merges of carried rules (in repairs)
+  };
+
+  /// \p fns are the functions whose instructions built \p g (their
+  /// extractvalue/insertvalue and memory transfers are sites).
+  PointerArithmeticClosure(seadsa::Graph &g, const DataLayout &dl,
+                           ArrayRef<const Function *> fns)
+      : m_graph(g), m_dl(dl), m_fns(fns.begin(), fns.end()) {}
+
+  /// Runs the closure to its fixpoint and returns its statistics.
+  const Stats &run();
+
+  /// Appends to \p callerG the rules of this graph (its own sites and the
+  /// rules carried into it) mapped through the cloner \p C of one call site;
+  /// returns how many were dropped because their node was not cloned.
+  unsigned carryInto(seadsa::Graph &callerG, seadsa::Cloner &C);
+
+private:
+  /// Inclusive byte interval; hi == None means +oo.
+  struct Interval {
+    int64_t lo = 0;
+    Optional<int64_t> hi;
+  };
+
+  /// p = q + offset (+ i * stride), with the offset as the local pass
+  /// computes it (computeGepOffset, computeIndexedOffset).
+  struct Site {
+    const Value *inst;
+    /// p's cell; null for a field of an aggregate (extractvalue/insertvalue),
+    /// whose cell raw(q) + offset on q's node the local pass derives once
+    const seadsa::Cell *p;
+    const seadsa::Cell *q;
+    int64_t offset;
+    uint64_t stride;
+    boost::optional<unsigned> arraySize;
+    /// a callee rule carried into the graph (Graph::CarriedSite)
+    bool carried = false;
+  };
+
+  /// A lazy memcpy/memmove, copied once by the local pass.
+  struct CopySite {
+    MemTransferInst *inst;
+    const seadsa::Cell *src;
+    const seadsa::Cell *dst;
+  };
+
+  /// The loop terminates without it (see the design note), but a chain of
+  /// dependencies ordered against the sites needs one run per link; this cap
+  /// bounds the cost. Reaching it collapses the nodes that still violate a
+  /// rule (fallback()).
+  static constexpr unsigned kMaxRuns = 1000;
+
+  seadsa::Graph &m_graph;
+  const DataLayout &m_dl;
+  std::vector<const Function *> m_fns;
+  /// The graph's scalar map, indexed (Graph::getCell would create a cell, and
+  /// a node, for a global)
+  DenseMap<const Value *, const seadsa::Cell *> m_scalars;
+  std::vector<Site> m_sites;
+  std::vector<CopySite> m_copies;
+  Stats m_stats;
+
+  const seadsa::Cell *lookupCell(const Value &u);
+  void collectSites();
+  void addGepSite(const GEPOperator &gep, const seadsa::Cell *p);
+  void addIntToPtrSite(const IntToPtrInst &i2p, const seadsa::Cell *p);
+  void addFieldSite(const Instruction &inst, const Value &agg,
+                    ArrayRef<unsigned> indices);
+  void addCopySite(MemTransferInst &inst);
+
+  static Interval cover(const seadsa::Node &n, unsigned o, bool &inInterval);
+  static bool contains(const Interval &outer, const Interval &inner);
+  /// True if \p a and \p b resolve to one cell (same node; same interval,
+  /// point, position modulo the stride, or the node is collapsed).
+  static bool sameCell(const seadsa::Cell &a, const seadsa::Cell &b);
+  /// True if one cell of \p n holds the bytes [lo, hi].
+  static bool coversRange(const seadsa::Node &n, uint64_t lo, uint64_t hi);
+  Optional<Interval> required(const Interval &iq, const Site &s) const;
+  /// p's raw offset (derived for a field site); false if out of range.
+  static bool rawOfP(const Site &s, unsigned &raw);
+  /// Returns the node whose cells must be merged, with the (widened) interval
+  /// \p w to merge, or null if the rule of \p s holds or does not apply.
+  seadsa::Node *evaluate(const Site &s, Interval &w, bool &widened);
+  void repair(seadsa::Node &n, const Interval &w, bool widened,
+              const Site &s);
+  /// True if re-applying the lazy copy \p c would change nothing.
+  bool copyClosed(const CopySite &c);
+  /// Re-applies the lazy copy \p c if it is not closed; returns true if the
+  /// graph changed.
+  bool reapplyCopy(const CopySite &c);
+  /// Collapses the sequence nodes that carry an interval; returns how many.
+  unsigned collapseSequenceIntervals();
+  /// After kMaxRuns: collapses the nodes that still violate a rule and
+  /// unifies the copies that are not closed until a sweep finds nothing.
+  void fallback();
+};
+
+const seadsa::Cell *PointerArithmeticClosure::lookupCell(const Value &u) {
+  // -- never create a cell (Graph::getCell creates one, and a node, for a
+  // -- global): formals through the graph, other values through the index
+  const Value &v = *u.stripPointerCasts();
+  if (isa<Argument>(v)) {
+    if (!m_graph.hasCell(v)) return nullptr;
+    const seadsa::Cell &c = m_graph.getCell(v);
+    return c.isNull() ? nullptr : &c;
+  }
+  auto it = m_scalars.find(&v);
+  if (it == m_scalars.end() || it->second->isNull()) return nullptr;
+  return it->second;
+}
+
+void PointerArithmeticClosure::collectSites() {
+  for (auto &kv : m_graph.scalars()) m_scalars[kv.first] = kv.second.get();
+  // -- m_values iterates in insertion (IR) order: deterministic runs
+  for (auto &kv : m_graph.scalars()) {
+    const seadsa::Cell *p = kv.second.get();
+    if (!p || p->isNull()) continue;
+    if (auto *gep = dyn_cast<GEPOperator>(kv.first))
+      addGepSite(*gep, p);
+    else if (auto *i2p = dyn_cast<IntToPtrInst>(kv.first))
+      addIntToPtrSite(*i2p, p);
+  }
+  // -- fields of first-class aggregates and lazy copies, in IR order of the
+  // -- functions that built the graph
+  for (const Function *F : m_fns) {
+    for (const BasicBlock &bb : *F) {
+      for (const Instruction &I : bb) {
+        if (auto *ev = dyn_cast<ExtractValueInst>(&I)) {
+          // -- the local pass reads a link only for a pointer result
+          if (ev->getType()->isPointerTy())
+            addFieldSite(I, *ev->getAggregateOperand(), ev->getIndices());
+        } else if (auto *iv = dyn_cast<InsertValueInst>(&I)) {
+          // -- ... and writes one only for a pointer that is not null/undef
+          const Value &v = *iv->getInsertedValueOperand();
+          const Value *sv = v.stripPointerCasts();
+          if (v.getType()->isPointerTy() && !isa<UndefValue>(sv) &&
+              !(isa<Constant>(sv) && cast<Constant>(sv)->isNullValue()))
+            addFieldSite(I, *iv->getAggregateOperand(), iv->getIndices());
+        } else if (auto *mt = dyn_cast<MemTransferInst>(&I)) {
+          if (EnableLazyMemTransfer)
+            addCopySite(*const_cast<MemTransferInst *>(mt));
+        }
+      }
+    }
+  }
+  // -- the callee rules carried into the graph (butd-cs), in carry order
+  for (const seadsa::Graph::CarriedSite &cs : m_graph.carriedSites()) {
+    if (cs.p->isNull() || cs.q->isNull()) continue;
+    Site site{cs.inst, cs.p.get(), cs.q.get(), cs.offset, cs.stride,
+              cs.arraySize};
+    site.carried = true;
+    m_sites.push_back(site);
+    ++m_stats.carried;
+  }
+  m_stats.sites = m_sites.size();
+  m_stats.copies = m_copies.size();
+}
+
+unsigned PointerArithmeticClosure::carryInto(seadsa::Graph &callerG,
+                                             seadsa::Cloner &C) {
+  collectSites();
+  unsigned dropped = 0;
+  SmallVector<seadsa::Node *, 4> clones;
+  for (const Site &s : m_sites) {
+    seadsa::Node *nq = s.q->getNode();
+    // -- a rule on two nodes or on a collapsed node never fails
+    if ((s.p && s.p->getNode() != nq) || nq->isOffsetCollapsed()) continue;
+    unsigned rawP = 0;
+    if (!rawOfP(s, rawP)) continue;
+    const unsigned rawQ = s.q->getRawOffset();
+    // -- the node's clones in the caller: its cached clone and its clones
+    // -- split per allocation site (globals, bottom-up flow-sensitive option)
+    clones.clear();
+    C.clonesOf(*nq, clones);
+    if (clones.empty()) {
+      // -- a node the call does not clone is not visible to the caller
+      ++dropped;
+      continue;
+    }
+    for (seadsa::Node *cn : clones) {
+      seadsa::CellRef pc(new seadsa::Cell(cn, rawP));
+      seadsa::CellRef qc(new seadsa::Cell(cn, rawQ));
+      // -- resolve forwarding: the clone may have been unified meanwhile
+      if (qc->getNode()->isOffsetCollapsed()) continue;
+      pc->getNode();
+      callerG.carriedSites().push_back({std::move(pc), std::move(qc), s.offset,
+                                        s.stride, s.arraySize, s.inst});
+    }
+  }
+  return dropped;
+}
+
+void PointerArithmeticClosure::addGepSite(const GEPOperator &gep,
+                                          const seadsa::Cell *p) {
+  // -- vector GEPs have no cell of their own (see visitGep)
+  if (!gep.getType()->isPointerTy()) return;
+  const Value &base = *gep.getPointerOperand();
+  if (!base.getType()->isPointerTy()) return;
+  if (base.stripPointerCasts() == &gep) return;
+  const seadsa::Cell *q = lookupCell(base);
+  if (!q) return;
+  SmallVector<Value *, 8> indicies(gep.idx_begin(), gep.idx_end());
+  GepOffset off = computeGepOffset(base.getType(), indicies, m_dl);
+  // -- the extent only when it bounds every symbolic index (as visitGep in
+  // -- the closed model)
+  m_sites.push_back({&gep, p, q, off.noffset, off.stride,
+                     toUnsignedArraySize(off.boundingArraySize())});
+}
+
+void PointerArithmeticClosure::addFieldSite(const Instruction &inst,
+                                            const Value &agg,
+                                            ArrayRef<unsigned> indices) {
+  // -- the aggregate's cell (visitExtractValueInst/visitInsertValueInst give
+  // -- one to every aggregate operand they visit)
+  const seadsa::Cell *q = lookupCell(agg);
+  if (!q) return;
+  const uint64_t off = computeIndexedOffset(agg.getType(), indices, m_dl);
+  // -- field 0 is q's own cell
+  if (off == 0 || off > std::numeric_limits<unsigned>::max()) return;
+  m_sites.push_back(
+      {&inst, nullptr, q, static_cast<int64_t>(off), 0, boost::none});
+  ++m_stats.derived;
+}
+
+void PointerArithmeticClosure::addCopySite(MemTransferInst &inst) {
+  // -- as visitMemTransferInst: both operands have cells (a null constant
+  // -- or an operand without a cell is skipped there)
+  const seadsa::Cell *src = lookupCell(*inst.getSource());
+  const seadsa::Cell *dst = lookupCell(*inst.getDest());
+  if (!src || !dst) return;
+  m_copies.push_back({&inst, src, dst});
+}
+
+void PointerArithmeticClosure::addIntToPtrSite(const IntToPtrInst &i2p,
+                                               const seadsa::Cell *p) {
+  // -- the fixed-offset cases of BlockBuilderBase::isFixedOffset:
+  // -- inttoptr(ptrtoint(b) + C) and inttoptr(load + C)
+  using namespace llvm::PatternMatch;
+  Value *x = nullptr;
+  ConstantInt *c = nullptr;
+  Value *op = i2p.getOperand(0);
+  if (!(match(op, m_Add(m_Value(x), m_ConstantInt(c))) ||
+        match(op, m_Add(m_ConstantInt(c), m_Value(x)))))
+    return;
+  Value *base = nullptr;
+  if (!match(x, m_PtrToInt(m_Value(base)))) {
+    if (!isa<LoadInst>(x)) return;
+    base = x;
+  }
+  if (c->getBitWidth() > 64) return;
+  const seadsa::Cell *q = lookupCell(*base);
+  if (!q) return;
+  m_sites.push_back({&i2p, p, q, c->getSExtValue(), 0, boost::none});
+}
+
+PointerArithmeticClosure::Interval
+PointerArithmeticClosure::cover(const seadsa::Node &n, unsigned o,
+                                bool &inInterval) {
+  Interval res;
+  for (const seadsa::Cell &ck : n.getCollapsedCells()) {
+    if (!ck.includes(o)) continue;
+    inInterval = true;
+    res.lo = ck.getRawStartOffset();
+    if (auto end = ck.getRawEndOffset()) res.hi = static_cast<int64_t>(*end);
+    return res;
+  }
+  inInterval = false;
+  res.lo = o;
+  res.hi = static_cast<int64_t>(o);
+  return res;
+}
+
+bool PointerArithmeticClosure::contains(const Interval &outer,
+                                        const Interval &inner) {
+  if (inner.lo < outer.lo) return false;
+  if (!outer.hi) return true;
+  return inner.hi && *inner.hi <= *outer.hi;
+}
+
+Optional<PointerArithmeticClosure::Interval>
+PointerArithmeticClosure::required(const Interval &iq, const Site &s) const {
+  Interval r;
+  if (checkedAdd(iq.lo, s.offset, r.lo)) return None;
+  int64_t hi = 0;
+  if (s.stride == 0) {
+    // -- p = q + c: I(q) shifted by c
+    if (iq.hi && !checkedAdd(*iq.hi, s.offset, hi)) r.hi = hi;
+  } else if (s.offset >= 0 && s.arraySize) {
+    // -- the array extent from lo(I(q)) + c, as the local pass bounds the
+    // -- interval (Node::unifyAt), and index 0 from every base in I(q)
+    const uint64_t sz = *s.arraySize;
+    const int64_t ext = sz >= s.stride ? static_cast<int64_t>(sz - s.stride) : 0;
+    if (iq.hi && !checkedAdd(r.lo, ext, hi)) {
+      int64_t h0 = 0;
+      if (!checkedAdd(*iq.hi, s.offset, h0)) r.hi = std::max(hi, h0);
+    }
+  }
+  // -- otherwise +oo: no array extent, or a negative constant part (the index
+  // -- must then exceed the array length to stay in the object)
+
+  // -- 0 is the smallest offset of a node
+  if (r.lo < 0) r.lo = 0;
+  if (r.hi && *r.hi < r.lo) r.hi = r.lo;
+  if (r.lo > std::numeric_limits<unsigned>::max()) return None;
+  if (r.hi && *r.hi > std::numeric_limits<unsigned>::max()) r.hi = None;
+  return r;
+}
+
+bool PointerArithmeticClosure::sameCell(const seadsa::Cell &a,
+                                        const seadsa::Cell &b) {
+  const seadsa::Node *na = a.getNode();
+  if (na != b.getNode()) return false;
+  if (na->isOffsetCollapsed()) return true;
+  const unsigned ra = a.getRawOffset(), rb = b.getRawOffset();
+  if (na->isArray())
+    return na->size() == 0 ? ra == rb
+                           : ra % na->size() == rb % na->size();
+  bool ia = false, ib = false;
+  const Interval ca = cover(*na, ra, ia), cb = cover(*na, rb, ib);
+  return ia == ib && ca.lo == cb.lo && ca.hi == cb.hi;
+}
+
+bool PointerArithmeticClosure::coversRange(const seadsa::Node &n, uint64_t lo,
+                                           uint64_t hi) {
+  if (n.isOffsetCollapsed()) return true;
+  if (lo == hi) return true;
+  // -- a sequence node carries no interval in the closed model
+  if (n.isArray() || lo > std::numeric_limits<unsigned>::max()) return false;
+  bool in = false;
+  const Interval c = cover(n, static_cast<unsigned>(lo), in);
+  return in && (!c.hi || static_cast<uint64_t>(*c.hi) >= hi);
+}
+
+bool PointerArithmeticClosure::rawOfP(const Site &s, unsigned &raw) {
+  if (s.p) {
+    raw = s.p->getRawOffset();
+    return true;
+  }
+  // -- a field cell: raw(q) + offset, as the local pass derives it
+  const int64_t r = static_cast<int64_t>(s.q->getRawOffset()) + s.offset;
+  if (r < 0 || r > std::numeric_limits<unsigned>::max()) return false;
+  raw = static_cast<unsigned>(r);
+  return true;
+}
+
+seadsa::Node *PointerArithmeticClosure::evaluate(const Site &s, Interval &w,
+                                                 bool &widened) {
+  seadsa::Node *nq = s.q->getNode();
+  seadsa::Node *np = s.p ? s.p->getNode() : nq;
+  // -- collapsed nodes are closed; sequence nodes (no interval, see
+  // -- collapseSequenceIntervals) are closed modulo the stride
+  if (nq->isOffsetCollapsed() || nq->isArray()) return nullptr;
+  if (np != nq) {
+    // -- p's cell does not come from q's (e.g. an unresolved inttoptr)
+    if (m_stats.runs == 1) ++m_stats.mismatch;
+    return nullptr;
+  }
+  // -- a point-only node is closed after the one-pass construction, except
+  // -- for a symbolic GEP with a negative constant part (visitGep drops the
+  // -- symbolic part)
+  const bool negSym = s.stride != 0 && s.offset < 0;
+  if (nq->getCollapsedCells().empty() && !negSym) return nullptr;
+  ++m_stats.rechecked;
+
+  unsigned rawP = 0;
+  if (!rawOfP(s, rawP)) return nullptr;
+  bool qInInterval = false, pInInterval = false;
+  Optional<Interval> r =
+      required(cover(*nq, s.q->getRawOffset(), qInInterval), s);
+  if (!r) return nullptr;
+  const Interval cp = cover(*np, rawP, pInInterval);
+  if (contains(cp, *r)) return nullptr;
+
+  widened = pInInterval;
+  if (pInInterval) {
+    // -- [a,b] widen ([a,b] join R)
+    w.lo = r->lo < cp.lo ? 0 : cp.lo;
+    w.hi = cp.hi;
+    if (cp.hi && (!r->hi || *r->hi > *cp.hi)) w.hi = None;
+  } else {
+    // -- a point becomes the join of R and p's offset
+    w.lo = std::min<int64_t>(r->lo, rawP);
+    w.hi = None;
+    if (r->hi) w.hi = std::max<int64_t>(*r->hi, rawP);
+  }
+  return np;
+}
+
+void PointerArithmeticClosure::repair(seadsa::Node &n, const Interval &w,
+                                      bool widened, const Site &s) {
+  boost::optional<unsigned> end = boost::none;
+  if (w.hi) end = static_cast<unsigned>(*w.hi);
+  LOG("dsa-closure-detail", unsigned rp = 0; rawOfP(s, rp);
+      errs() << "  run " << m_stats.runs << ": " << *s.inst << "\n"
+             << "    q-raw=" << s.q->getRawOffset() << " p-raw=" << rp
+             << (s.p ? "" : " (field)") << (s.carried ? " (carried)" : "")
+             << " offset=" << s.offset
+             << " stride=" << s.stride << " merge [" << w.lo << ",";
+      if (end) errs() << *end; else errs() << "+oo";
+      errs() << "]" << (widened ? " (widened)" : "") << "\n";);
+  n.partialCollapseOffsets(static_cast<unsigned>(w.lo), end, __LINE__);
+  ++m_stats.repairs;
+  if (!s.p) ++m_stats.derivedRepairs;
+  if (s.carried) ++m_stats.carriedRepairs;
+  if (widened) ++m_stats.widened;
+  if (n.getNode()->isOffsetCollapsed()) ++m_stats.collapsed;
+}
+
+bool PointerArithmeticClosure::copyClosed(const CopySite &c) {
+  seadsa::Cell src(*c.src), dst(*c.dst);
+  const unsigned size = lazyCopySize(*c.inst, true, src, m_dl);
+  const LazyCopyPlan plan = planLazyCopy(src, size, LazyMemTransferByCell);
+  if (plan.eager)
+    return eagerCopiesNothing(*c.inst, true, src, m_dl) || sameCell(dst, src);
+  for (const LazyCopyPlan::Link &l : plan.links) {
+    const seadsa::Node *nd = dst.getNode();
+    const uint64_t d = dst.getRawOffset();
+    // -- the image of an interval cell lies in one cell of the destination
+    if (l.hi > l.lo && !coversRange(*nd, d + l.lo, d + l.hi)) return false;
+    if (d + l.lo > std::numeric_limits<unsigned>::max()) return false;
+    const seadsa::Field f(static_cast<unsigned>(d + l.lo), l.field.getType());
+    const seadsa::Cell *t = nullptr;
+    if (nd->hasLink(f))
+      t = &nd->getLink(f);
+    else if (!seadsa::FieldType::IsNotTypeAware() && !f.hasOmniType() &&
+             nd->hasLink(f.mkOmniField()))
+      t = &nd->getLink(f.mkOmniField());
+    if (!t || !sameCell(*t, l.target)) return false;
+  }
+  return true;
+}
+
+bool PointerArithmeticClosure::reapplyCopy(const CopySite &c) {
+  if (copyClosed(c)) return false;
+  seadsa::Cell src(*c.src), dst(*c.dst);
+  const unsigned size = lazyCopySize(*c.inst, true, src, m_dl);
+  const LazyCopyPlan plan = planLazyCopy(src, size, LazyMemTransferByCell);
+  LOG("dsa-closure-detail",
+      errs() << "  run " << m_stats.runs << ": " << *c.inst << "\n"
+             << "    copy " << size << " bytes from raw " << src.getRawOffset()
+             << (plan.eager ? ": unify (eager rule)"
+                            : ": re-apply the lazy copy")
+             << "\n";);
+  if (plan.eager) {
+    dst.unify(src);
+    ++m_stats.copyUnified;
+  } else {
+    applyLazyCopy(plan, src, dst, false);
+  }
+  ++m_stats.copyRepairs;
+  return true;
+}
+
+unsigned PointerArithmeticClosure::collapseSequenceIntervals() {
+  // -- collect first: collapseOffsets adds nodes to the graph
+  SmallVector<seadsa::Node *, 4> seqs;
+  for (seadsa::Node &n : m_graph)
+    if (!n.isForwarding() && n.isArray() && !n.getCollapsedCells().empty())
+      seqs.push_back(&n);
+  unsigned res = 0;
+  for (seadsa::Node *n : seqs) {
+    seadsa::Node *r = n->getNode();
+    if (!r->isArray() || r->getCollapsedCells().empty()) continue;
+    LOG("dsa-closure", errs() << "safety net: sequence node with an interval "
+                                 "collapsed\n";);
+    r->collapseOffsets(__LINE__);
+    ++res;
+  }
+  m_stats.safety += res;
+  return res;
+}
+
+void PointerArithmeticClosure::fallback() {
+  m_stats.capHit = true;
+  // -- every collapse removes a node that is not collapsed and none is ever
+  // -- created; a copy whose source and destination are unified stays closed
+  // -- (unified cells stay one cell); so the sweeps end
+  for (;;) {
+    ++m_stats.fallbackSweeps;
+    unsigned changed = collapseSequenceIntervals();
+    for (const Site &s : m_sites) {
+      Interval w;
+      bool widened = false;
+      if (seadsa::Node *n = evaluate(s, w, widened)) {
+        n->collapseOffsets(__LINE__);
+        ++m_stats.fallback;
+        ++changed;
+      }
+    }
+    for (const CopySite &c : m_copies) {
+      if (copyClosed(c)) continue;
+      seadsa::Cell src(*c.src), dst(*c.dst);
+      dst.unify(src);
+      ++m_stats.fallback;
+      ++changed;
+    }
+    if (changed == 0) break;
+  }
+}
+
+const PointerArithmeticClosure::Stats &PointerArithmeticClosure::run() {
+  collectSites();
+  for (;;) {
+    ++m_stats.runs;
+    unsigned changed = collapseSequenceIntervals();
+    for (const Site &s : m_sites) {
+      Interval w;
+      bool widened = false;
+      if (seadsa::Node *n = evaluate(s, w, widened)) {
+        repair(*n, w, widened, s);
+        ++changed;
+      }
+    }
+    for (const CopySite &c : m_copies)
+      if (reapplyCopy(c)) ++changed;
+    if (changed == 0) break;
+    if (m_stats.runs == kMaxRuns) {
+      fallback();
+      break;
+    }
+  }
+  return m_stats;
+}
+
+/// Totals of closeUnderPointerArithmetic since resetClosureStats(), for
+/// printClosureStats (--sea-dsa-stats).
+struct ClosureTotals {
+  unsigned graphs = 0;
+  unsigned runsMax = 0;
+  unsigned repairs = 0;
+  unsigned widened = 0;
+  unsigned collapsed = 0;
+  unsigned capHits = 0;
+  unsigned fallback = 0;
+  unsigned safety = 0;
+  unsigned sequence = 0; ///< Node::partialCollapseOffsets and Cell::unify
+  unsigned derivedRepairs = 0;
+  unsigned copyRepairs = 0;
+  unsigned copyUnified = 0;
+  unsigned carriedRepairs = 0;
+  unsigned carryDropped = 0; ///< callee rules on nodes a call does not clone
+  uint64_t carried = 0;      ///< callee rules appended to callers' graphs
+};
+
+ClosureTotals &closureTotals() {
+  static ClosureTotals totals;
+  return totals;
+}
+
+#endif // SEA_BUILD_IDSA
+
 } // end namespace
 
 /*****************************************************************************/
 /* PUBLIC API                                                                */
 /*****************************************************************************/
 namespace seadsa {
+
+bool closeUnderPointerArithmetic(Graph &g, const DataLayout &dl,
+                                 ArrayRef<const Function *> fns,
+                                 StringRef phase, StringRef name) {
+#ifdef SEA_BUILD_IDSA
+  if (!isClosedModel() || g.isFlat()) return false;
+  SEADSA_SCOPED_STATS("idsa.closure", 1);
+  PointerArithmeticClosure closure(g, dl, fns);
+  const PointerArithmeticClosure::Stats &st = closure.run();
+  LOG("dsa-closure", errs() << "closure " << phase << " " << name
+                            << ": sites=" << st.sites << " runs=" << st.runs
+                            << " rechecked=" << st.rechecked
+                            << " repairs=" << st.repairs
+                            << " widened=" << st.widened
+                            << " collapsed=" << st.collapsed
+                            << " mismatch=" << st.mismatch
+                            << " safety=" << st.safety
+                            << " fallback=" << st.fallback
+                            << " fields=" << st.derived
+                            << " field_repairs=" << st.derivedRepairs
+                            << " copies=" << st.copies
+                            << " copy_repairs=" << st.copyRepairs
+                            << " copy_unified=" << st.copyUnified
+                            << " carried=" << st.carried
+                            << " carried_repairs=" << st.carriedRepairs
+                            << "\n";);
+  ClosureTotals &t = closureTotals();
+  ++t.graphs;
+  t.runsMax = std::max(t.runsMax, st.runs);
+  t.repairs += st.repairs;
+  t.widened += st.widened;
+  t.collapsed += st.collapsed;
+  t.fallback += st.fallback;
+  t.safety += st.safety;
+  t.derivedRepairs += st.derivedRepairs;
+  t.copyRepairs += st.copyRepairs;
+  t.copyUnified += st.copyUnified;
+  t.carriedRepairs += st.carriedRepairs;
+  if (st.capHit) {
+    ++t.capHits;
+    // -- unconditional: the harness records stderr and must see this
+    errs() << "WARNING (sea-dsa): I-DSA closure hit the run cap in " << phase
+           << " " << name << ": " << st.runs << " runs, then "
+           << st.fallbackSweeps << " sweeps collapsed " << st.fallback
+           << " nodes (or unified copies) to close the graph\n";
+  }
+  return st.repairs > 0 || st.fallback > 0 || st.safety > 0 ||
+         st.copyRepairs > 0;
+#else
+  // -- the classic graph has no interval cells
+  (void)g;
+  (void)dl;
+  (void)fns;
+  (void)phase;
+  (void)name;
+  return false;
+#endif
+}
+
+void carryClosureSites(Graph &calleeG, ArrayRef<const Function *> calleeFns,
+                       Graph &callerG, Cloner &C, const DataLayout &dl) {
+#ifdef SEA_BUILD_IDSA
+  if (!isClosedModel() || !CarryCalleeSites) return;
+  if (&calleeG == &callerG || calleeG.isFlat() || callerG.isFlat()) return;
+  const size_t before = callerG.carriedSites().size();
+  PointerArithmeticClosure rules(calleeG, dl, calleeFns);
+  const unsigned dropped = rules.carryInto(callerG, C);
+  ClosureTotals &t = closureTotals();
+  t.carryDropped += dropped;
+  t.carried += callerG.carriedSites().size() - before;
+#else
+  (void)calleeG;
+  (void)calleeFns;
+  (void)callerG;
+  (void)C;
+  (void)dl;
+#endif
+}
+
+void resetClosureStats() {
+#ifdef SEA_BUILD_IDSA
+  closureTotals() = ClosureTotals();
+#endif
+}
+
+void printClosureStats(raw_ostream &o) {
+#ifdef SEA_BUILD_IDSA
+  if (!isClosedModel()) return;
+  const ClosureTotals &t = closureTotals();
+  o << "\tI-DSA closure: graphs=" << t.graphs << " runs_max=" << t.runsMax
+    << " repairs=" << t.repairs << " widened=" << t.widened
+    << " collapsed=" << t.collapsed << " cap_hits=" << t.capHits
+    << " fallback_collapsed=" << t.fallback
+    << " sequence_collapsed=" << t.sequence
+    << " safety_collapsed=" << t.safety
+    << " field_repairs=" << t.derivedRepairs
+    << " copy_repairs=" << t.copyRepairs
+    << " copy_unified=" << t.copyUnified;
+  if (CarryCalleeSites)
+    o << " carried=" << t.carried << " carried_repairs=" << t.carriedRepairs
+      << " carry_dropped=" << t.carryDropped;
+  o << "\n";
+#else
+  (void)o;
+#endif
+}
+
+#ifdef SEA_BUILD_IDSA
+void noteSequenceIntervalCollapse() { ++closureTotals().sequence; }
+#endif
 
 /*****************************************************************************/
 /* LocalAnalysis                                                             */
@@ -2310,6 +3281,10 @@ void LocalAnalysis::runOnFunction(Function &F, Graph &g) {
       }
     }
   }
+
+  // -- I-DSA: re-apply the pointer-arithmetic rules until closed
+  const Function *fn = &F;
+  closeUnderPointerArithmetic(g, m_dl, fn, "local", F.getName());
 
   g.compress();
   g.remove_dead();

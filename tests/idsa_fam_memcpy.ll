@@ -1,9 +1,15 @@
-; RUN: %seadsa %s %ci_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-dot --sea-dsa-dot-outdir=%T/fam-ci
+; RUN: %seadsa %s %ci_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-partial-collapse-closure=false --sea-dsa-dot --sea-dsa-dot-outdir=%T/fam-ci
 ; RUN: cat %T/fam-ci/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CI
-; RUN: %seadsa %s %butd_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-dot --sea-dsa-dot-outdir=%T/fam-butd
+; RUN: %seadsa %s %butd_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-partial-collapse-closure=false --sea-dsa-dot --sea-dsa-dot-outdir=%T/fam-butd
 ; RUN: cat %T/fam-butd/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=MAIN
 ; RUN: cat %T/fam-butd/push.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=PUSH
 ; RUN: cat %T/fam-butd/namevalue.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=NV
+; RUN: %seadsa %s %ci_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-dot --sea-dsa-dot-outdir=%T/fam-ci-closed
+; RUN: cat %T/fam-ci-closed/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CLOSED
+; RUN: %seadsa %s %butd_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-dot --sea-dsa-dot-outdir=%T/fam-butd-closed
+; RUN: cat %T/fam-butd-closed/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CLOSED
+; RUN: cat %T/fam-butd-closed/push.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CLOSED
+; RUN: cat %T/fam-butd-closed/namevalue.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CLOSED
 ;
 ; curl's Curl_headers_push shape (see tests/c/idsa_fam_memcpy.c): a calloc'd
 ; struct with a flexible array member `buffer` at 29, a memcpy of unknown
@@ -22,6 +28,12 @@
 ; The [27-28] cell is namevalue's `end`/`end-1` (a negative GEP off the
 ; symbolic header+hlen lands one/two bytes before the interval) and is not
 ; checked here.
+; CI, MAIN, PUSH and NV check the one-pass construction
+; (--sea-dsa-partial-collapse-closure=false). In the default (closed) model the
+; closure re-applies end = (header+hlen) - 1 to [2,+oo], so end's cell [0,1]
+; must cover [1,+oo]; namevalue's string node reaches [0,+oo], i.e. it
+; collapses, and so does every node it is embedded into: in every view the
+; store node is collapsed and name/value point back into it (CLOSED).
 ;
 ; The phi operands of %.02 (the `end--` loop) were reordered by hand, loop
 ; back-edge first, as clang -O1 emits for curl's loop: the same-node
@@ -39,6 +51,8 @@
 ; NV: ^.*shape=record(?=.*[{,]8:i8\*)(?=.*[{,]16:i8\*)(?=.*[{,]24:i32)(?=.*\[29-\+oo\]:raw)
 ; NV: ^\s*(Node0x[0-9a-f]+):s0 -> \1\[arrowtail=tee,label="29, omni_i8\*"
 ; NV: ^\s*(Node0x[0-9a-f]+):s1 -> \1\[arrowtail=tee,label="29, omni_i8\*"
+; CLOSED: ^.*shape=record,fillcolor=chocolate1.*OFFSET-COLLAPSED:SHMR
+; CLOSED: ^\s*(Node0x[0-9a-f]+):s0 -> \1\[arrowtail=tee,label="0, omni_i8\*"
 
 ; ModuleID = 'idsa_fam_memcpy.ll'
 source_filename = "idsa_fam_memcpy.c"

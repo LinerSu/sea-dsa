@@ -155,6 +155,19 @@ bool TopDownAnalysis::runOnModule(Module &M, GraphMap &graphs) {
       }
 
       Graph &callerG = *it->second;
+      // I-DSA: all callers have pushed their nodes into callerG, which may
+      // have grown its nodes; close it before pushing it down to the callees.
+      // The members of the SCC share callerG (bottom-up built it from them).
+      SmallVector<const Function *, 4> graphFns;
+      for (CallGraphNode *member : scc) {
+        const Function *mf = member->getFunction();
+        if (!mf || mf->isDeclaration() || mf->empty()) continue;
+        auto mit = graphs.find(mf);
+        if (mit != graphs.end() && mit->second.get() == &callerG)
+          graphFns.push_back(mf);
+      }
+      closeUnderPointerArithmetic(callerG, M.getDataLayout(), graphFns, "td",
+                                  fn->getName());
       // Compress before pushing down the graph to all callees. We know that
       // it's sufficient to compress only once -- the call graph nodes are
       // processed in topological order, so all callers must have already pushed

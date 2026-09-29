@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Function.h"
@@ -38,10 +39,15 @@ private:
   bool m_flowSensitiveOpt;
 
 public:
-  static void cloneAndResolveArguments(const DsaCallSite &CS, Graph &calleeG,
-                                       Graph &callerG,
-                                       const DsaLibFuncInfo &dsaLibFuncInfo,
-                                       bool flowSensitiveOpt = true);
+  /// \p calleeFns: the functions whose instructions built calleeG (their
+  /// pointer-arithmetic rules are carried into callerG in the closed I-DSA
+  /// model, see carryClosureSites).
+  static void
+  cloneAndResolveArguments(const DsaCallSite &CS, Graph &calleeG,
+                           Graph &callerG,
+                           const DsaLibFuncInfo &dsaLibFuncInfo,
+                           bool flowSensitiveOpt = true,
+                           llvm::ArrayRef<const llvm::Function *> calleeFns = {});
 
   BottomUpAnalysis(const llvm::DataLayout &dl,
                    llvm::TargetLibraryInfoWrapperPass &tliWrapper,

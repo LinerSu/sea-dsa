@@ -12,6 +12,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <tuple>
 
 #include "seadsa/CallSite.hh"
 #include "seadsa/Cloner.hh"
@@ -775,6 +776,22 @@ void Node::partialCollapseOffsets(unsigned start, boost::optional<unsigned> end,
   LOG("dsa-nd", errs() << "pcollapse tag=" << tag << " [" << start << ",";
       if (end) errs() << end.get(); else errs() << "+oo"; errs() << "] ";
       ndWriteNode(errs(), *this); errs() << "\n";);
+  if (seadsa::g_IsPartialCollapseClosureEnabled && isArray()) {
+    // -- closed model: a sequence node carries no interval. Its offsets are
+    // -- canonicalized modulo the stride before intervals are looked at
+    // -- (Offset::getNumericOffset, Cell::getOffset), and an interval that
+    // -- wraps around the stride would be dropped below. An interval of more
+    // -- than one byte covers two positions (or all of them): collapse.
+    if (!end || end.get() > start) {
+      LOG("dsa-closure", errs() << "sequence node collapsed by an interval ["
+                                << start << ","
+                                << (end ? std::to_string(end.get()) : "+oo")
+                                << "] (tag " << tag << ")\n";);
+      collapseOffsets(tag);
+      noteSequenceIntervalCollapse();
+    }
+    return;
+  }
   Offset ostart(*this, start);
   start = ostart.getNumericOffset();
   if (end) {
@@ -1106,6 +1123,20 @@ void Cell::unify(Cell &c) {
     unsigned o2 = c.getRawOffset();
     boost::optional<unsigned> e2 = c.getRawEndOffset();
     if (seadsa::g_IsPartialCollapseEnabled && (&n1) == (&n2)) {
+      if (seadsa::g_IsPartialCollapseClosureEnabled && n1.isArray()) {
+        // -- closed model: a sequence node carries no interval (see
+        // -- Node::partialCollapseOffsets). Two points at the same position
+        // -- modulo the stride are already one cell; otherwise collapse, as
+        // -- plain SeaDSA does for a misaligned unification (Node::unifyAt).
+        const unsigned sz = n1.size();
+        const bool points = e1 && e2 && e1.get() == o1 && e2.get() == o2;
+        if (points && sz > 0 && o1 % sz == o2 % sz) return;
+        LOG("dsa-closure", errs() << "sequence node collapsed by unifying "
+                                  << o1 << " and " << o2 << "\n";);
+        n1.collapseOffsets(__LINE__);
+        noteSequenceIntervalCollapse();
+        return;
+      }
       unsigned start = std::min(o1, o2);
       boost::optional<unsigned> end;
       if (!e1 || !e2)
@@ -1321,6 +1352,8 @@ void Graph::compress() {
     kv.second->getNode();
   for (auto &cs : m_callSites)
     cs->getCell().getNode();
+  // -- resolves the carried rules' cells (and drops the settled ones)
+  if (!m_carriedSites.empty()) pruneCarriedSites(nullptr);
 
   // at this point, all cells and all nodes have their links
   // resolved. Every link points directly to the representative of the
@@ -1334,6 +1367,29 @@ void Graph::compress() {
                        return n->isForwarding();
                      }),
       m_nodes.end());
+}
+
+void Graph::pruneCarriedSites(const std::function<bool(const Node *)> &gone) {
+  // -- a rule is identified by its resolved cells and its offset
+  using Key = std::tuple<const Node *, unsigned, const Node *, unsigned,
+                         int64_t, uint64_t, unsigned, bool>;
+  std::set<Key> seen;
+  CarriedSites kept;
+  kept.reserve(m_carriedSites.size());
+  for (CarriedSite &s : m_carriedSites) {
+    const Node *np = s.p->getNode();
+    const Node *nq = s.q->getNode();
+    // -- settled for good: a collapsed node stays collapsed; p and q never
+    // -- come back to one node through a merge that keeps q's node apart
+    if (np != nq || np->isOffsetCollapsed()) continue;
+    if (gone && gone(np)) continue;
+    Key k(np, s.p->getRawOffset(), nq, s.q->getRawOffset(), s.offset,
+          s.stride, s.arraySize ? *s.arraySize : 0u,
+          static_cast<bool>(s.arraySize));
+    if (!seen.insert(k).second) continue;
+    kept.push_back(std::move(s));
+  }
+  m_carriedSites.swap(kept);
 }
 
 // pre: the graph has been compressed already
@@ -1384,6 +1440,11 @@ void Graph::remove_dead() {
       }
     }
   }
+
+  // -- the carried rules on unreachable nodes go with them
+  if (!m_carriedSites.empty())
+    pruneCarriedSites(
+        [&reachable](const Node *n) { return reachable.count(n) == 0; });
 
   // -- remove unreachable nodes using remove-erase idiom
   m_nodes.erase(
@@ -1495,6 +1556,9 @@ void Graph::removeNodes(std::function<bool(const Node *)> p) {
     assert(!C->isNull());
     return p(C->getNode());
   });
+
+  // -- remove the carried rules on nodes that satisfy p
+  if (!m_carriedSites.empty()) pruneCarriedSites(p);
 
   // -- remove references to nodes that satisfy p
   for (auto &n : m_nodes) {

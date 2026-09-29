@@ -7,6 +7,7 @@
 #include "seadsa/DsaAnalysis.hh"
 #include "seadsa/Graph.hh"
 #include "seadsa/Info.hh"
+#include "seadsa/Local.hh"
 #include "seadsa/Stats.hh"
 
 static llvm::cl::opt<unsigned> NodeSummarySize(
@@ -262,6 +263,8 @@ void DsaPrintStats::runOnModule(Module &M) {
   printMemUsageInfo(dsa_nodes, errs());
   printGraphInfo(dsa_nodes, errs());
   printAllocInfo(dsa_nodes, dsa_alloc_sites, errs());
+  // -- I-DSA closure totals (nothing unless the closed model is selected)
+  printClosureStats(errs());
   errs() << " ========== End SeaDsa stats  ==========\n";
 }
 

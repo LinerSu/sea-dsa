@@ -13,6 +13,7 @@
 #include "seadsa/Global.hh"
 #include "seadsa/Info.hh"
 #include "seadsa/InitializePasses.hh"
+#include "seadsa/Local.hh"
 #include "seadsa/Stats.hh"
 #include "seadsa/support/RemovePtrToInt.hh"
 
@@ -108,6 +109,8 @@ bool DsaAnalysis::runOnModule(Module &M) {
         true /* always store summary graphs*/));
   }
 
+  // -- the stats below report this run's I-DSA closure totals
+  resetClosureStats();
   m_ga->runOnModule(M);
 
   if (XDsaStats || m_print_stats) {

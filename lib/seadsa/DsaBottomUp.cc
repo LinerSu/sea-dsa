@@ -58,7 +58,8 @@ static const Value *findUniqueReturnValue(const Function &F) {
 // Clone callee nodes into caller and resolve arguments
 void BottomUpAnalysis::cloneAndResolveArguments(
     const DsaCallSite &CS, Graph &calleeG, Graph &callerG,
-    const DsaLibFuncInfo &dsaLibFuncInfo, bool flowSensitiveOpt) {
+    const DsaLibFuncInfo &dsaLibFuncInfo, bool flowSensitiveOpt,
+    ArrayRef<const Function *> calleeFns) {
   CloningContext context(*CS.getInstruction(), CloningContext::BottomUp);
   auto options = Cloner::BuildOptions(Cloner::StripAllocas);
   Cloner C(callerG, context, options);
@@ -134,6 +135,11 @@ void BottomUpAnalysis::cloneAndResolveArguments(
     }
   }
 
+  // -- I-DSA: the callee's pointer-arithmetic rules, re-checked by the
+  // -- caller's closures under the caller's intervals
+  carryClosureSites(calleeG, calleeFns, callerG, C,
+                    CS.getCaller()->getParent()->getDataLayout());
+
   callerG.compress();
 }
 
@@ -142,12 +148,17 @@ bool BottomUpAnalysis::runOnModule(Module &M, GraphMap &graphs) {
   LOG("dsa-bu", errs() << "Started bottom-up analysis ... \n");
 
   LocalAnalysis la(m_dl, m_tliWrapper, m_allocInfo);
+  // -- the functions whose instructions built each graph (I-DSA closure)
+  DenseMap<const Graph *, SmallVector<const Function *, 4>> graphFns;
 
   for (auto it = scc_begin(&m_cg); !it.isAtEnd(); ++it) {
     auto &scc = *it;
 
     // -- compute a local graph shared between all functions in the scc
     GraphRef fGraph = nullptr;
+    const Function *sccFn = nullptr;
+    // -- the functions whose instructions built fGraph (I-DSA closure)
+    SmallVector<const Function *, 4> sccFns;
     for (CallGraphNode *cgn : scc) {
       Function *fn = cgn->getFunction();
       if (!fn) continue;
@@ -157,17 +168,20 @@ bool BottomUpAnalysis::runOnModule(Module &M, GraphMap &graphs) {
         assert(graphs.find(fn) != graphs.end());
         fGraph = graphs[fn];
         assert(fGraph);
+        sccFn = fn;
       }
       if (m_dsaLibFuncInfo.hasSpecFunc(*fn)) {
         Function &spec_fn = *m_dsaLibFuncInfo.getSpecFunc(*fn);
         la.runOnFunction(spec_fn, *fGraph);
-
+        sccFns.push_back(&spec_fn);
       } else {
         la.runOnFunction(*fn, *fGraph);
+        sccFns.push_back(fn);
       }
 
       graphs[fn] = fGraph;
     }
+    if (fGraph) graphFns[fGraph.get()] = sccFns;
 
     std::vector<CallGraphNode *> cgns = call_graph_utils::SortedCGNs(scc);
     for (CallGraphNode *cgn : cgns) {
@@ -203,8 +217,12 @@ bool BottomUpAnalysis::runOnModule(Module &M, GraphMap &graphs) {
                           << ", caller collapsed:\t" << callerG.numCollapsed()
                           << "\n");
 
+        auto fit = graphFns.find(&calleeG);
+        ArrayRef<const Function *> calleeFns;
+        if (fit != graphFns.end()) calleeFns = fit->second;
         cloneAndResolveArguments(dsaCS, calleeG, callerG, m_dsaLibFuncInfo,
-                                 m_flowSensitiveOpt && !NoBUFlowSensitiveOpt);
+                                 m_flowSensitiveOpt && !NoBUFlowSensitiveOpt,
+                                 calleeFns);
 
         LOG("dsa-bu", llvm::errs()
                           << "\tCaller size after clone: " << callerG.numNodes()
@@ -212,7 +230,13 @@ bool BottomUpAnalysis::runOnModule(Module &M, GraphMap &graphs) {
       }
     }
 
-    if (fGraph) fGraph->compress();
+    if (fGraph) {
+      // -- I-DSA: the callees' nodes may have grown the SCC's nodes; close
+      // -- the graph before the callers clone it
+      closeUnderPointerArithmetic(*fGraph, m_dl, sccFns, "bu",
+                                  sccFn->getName());
+      fGraph->compress();
+    }
   }
 
   if (m_dsaLibFuncInfo.genSpecs()) {

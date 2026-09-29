@@ -187,6 +187,19 @@ Cell Cloner::cloneCell(const Cell &c, bool forceAddAlloca,
   return res;
 }
 
+void Cloner::clonesOf(const Node &n, llvm::SmallVectorImpl<Node *> &out) const {
+  // -- a node of the new graph is its own clone (see clone())
+  if (n.getGraph() == &m_graph) {
+    out.push_back(const_cast<Node *>(&n));
+    return;
+  }
+  auto it = m_map.find(&n);
+  if (it != m_map.end()) out.push_back(it->second.first);
+  auto dit = m_deferredUnify.find(&n);
+  if (dit != m_deferredUnify.end())
+    out.append(dit->second.begin(), dit->second.end());
+}
+
 void Cloner::copyAllocationSites(
     const Node &from, Node &to, bool forceAddAlloca,
     const llvm::Value *onlyAllocSite /* = nullptr */) {

@@ -1,6 +1,9 @@
-; RUN: %seadsa %s %butd_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-dot --sea-dsa-dot-outdir=%T/ei
+; RUN: %seadsa %s %butd_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-partial-collapse-closure=false --sea-dsa-dot --sea-dsa-dot-outdir=%T/ei
 ; RUN: cat %T/ei/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=MAIN
 ; RUN: cat %T/ei/f.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=F
+; RUN: %seadsa %s %butd_dsa --sea-dsa-type-aware --sea-dsa-partial-collapse --sea-dsa-dot --sea-dsa-dot-outdir=%T/ei-closed
+; RUN: cat %T/ei-closed/main.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CLOSED
+; RUN: cat %T/ei-closed/f.mem.dot | OutputCheck %s -d --comment=";" --check-prefix=CLOSED
 ;
 ; Embedding a node at an offset strictly inside an interval cell of the
 ; target (see tests/c/idsa_embed_inside_interval.c):
@@ -13,8 +16,13 @@
 ; the embedded node left by 4, putting in.c at 8.  Both the caller's (BU) and
 ; the callee's (TD) view of the object must show [0-7], 12:i32, 16:i32 and no
 ; field at 8.
+; MAIN and F check the one-pass construction (--sea-dsa-partial-collapse-closure=false).
+; In the default (closed) model, raw (offset 0) lies in [0,7], so raw+7 must
+; cover [7,14] and widening [0,7] gives [0,+oo]: o's node is collapsed in both
+; views (CLOSED).
 ; MAIN: ^.*shape=record(?=.*\[0-7\]:raw)(?=.*[{,]12:i32)(?=.*[{,]16:i32)(?!.*[{,]8:i32)
 ; F: ^.*shape=record(?=.*\[0-7\]:raw)(?=.*[{,]12:i32)(?=.*[{,]16:i32)(?!.*[{,]8:i32)
+; CLOSED: ^.*shape=record,fillcolor=chocolate1.*OFFSET-COLLAPSED:SMR
 
 ; ModuleID = 'idsa_embed_inside_interval.ll'
 source_filename = "c/idsa_embed_inside_interval.c"
